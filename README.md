@@ -1,10 +1,10 @@
 # Atlas — Agente de Dados
 
-Aplicação web local para conversar com uma IA sobre bases tabulares, diagnosticar qualidade de dados, treinar modelos de machine learning e gerar previsões em lote.
+Aplicação web Flask para conversar com uma IA sobre bases tabulares, diagnosticar qualidade de dados, treinar modelos de machine learning e gerar previsões em lote. Pode ser executada localmente ou publicada no Render.
 
 ## Funcionalidades
 
-- Chat com Gemini e histórico persistente em SQLite.
+- Chat com Gemini 3.5 Flash Lite e histórico em SQLite.
 - Conversas, planilhas e modelos isolados por sessão.
 - Upload de CSV e XLSX com diagnóstico automático.
 - Detecção automática de classificação ou regressão.
@@ -43,6 +43,24 @@ python app.py
 ```
 
 Acesse `http://127.0.0.1:5000`.
+
+## Publicação no Render
+
+O repositório inclui um Blueprint em `render.yaml`. Para publicar:
+
+1. Envie o projeto para um repositório no GitHub.
+2. No Render, escolha **New > Blueprint**.
+3. Selecione o repositório e mantenha `render.yaml` como Blueprint Path.
+4. Configure `GEMINI_API_KEY` como variável de ambiente secreta.
+5. Crie o serviço e aguarde o status **Live**.
+
+O Render instala as dependências e inicia a aplicação com:
+
+```text
+gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+```
+
+No plano gratuito, o serviço pode adormecer após um período sem acessos. O primeiro acesso seguinte pode demorar enquanto a instância reinicia.
 
 ## Como usar
 
@@ -84,6 +102,8 @@ Os testes cobrem histórico, isolamento de arquivos, validação, treinamento e 
 .
 ├── app.py                 # Aplicação Flask, persistência e ML
 ├── main.py                # Cliente de terminal experimental
+├── render.yaml            # Blueprint de publicação no Render
+├── .python-version        # Versão do Python usada no deploy
 ├── requirements.txt       # Dependências Python
 ├── static/style.css       # Estilos da interface
 ├── templates/index.html   # Interface e JavaScript
@@ -95,10 +115,10 @@ Consulte [Arquitetura](docs/ARCHITECTURE.md), [API](docs/API.md), [Segurança](S
 
 ## Limitações atuais
 
-- Projetado para execução local e usuário único.
+- Projetado para uso experimental e sem autenticação de usuários.
 - SQLite e executor em memória não são indicados para múltiplas instâncias.
 - Tarefas em andamento não sobrevivem ao reinício do processo.
-- Não há autenticação de usuários.
+- No plano gratuito do Render, SQLite, uploads e modelos ficam em armazenamento efêmero e podem ser perdidos após reinícios ou novos deploys.
 - A disponibilidade do chat depende da cota da API Gemini.
 
 ## Licença
