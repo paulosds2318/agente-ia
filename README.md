@@ -2,6 +2,8 @@
 
 Aplicação web Flask para conversar com uma IA sobre bases tabulares, diagnosticar qualidade de dados, treinar modelos de machine learning e gerar previsões em lote. Pode ser executada localmente ou publicada no Render.
 
+Aplicação publicada: [https://agente-ia-grns.onrender.com](https://agente-ia-grns.onrender.com)
+
 ## Funcionalidades
 
 - Chat com Gemini 3.5 Flash Lite e histórico em SQLite.
@@ -61,6 +63,8 @@ gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
 ```
 
 No plano gratuito, o serviço pode adormecer após um período sem acessos. O primeiro acesso seguinte pode demorar enquanto a instância reinicia.
+
+O endereço oficial deste projeto contém o sufixo `-grns`. Use o link acima para evitar abrir outro serviço com nome semelhante.
 
 ## Como usar
 
