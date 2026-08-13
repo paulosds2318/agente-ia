@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 from google import genai
 from dotenv import load_dotenv
 import os
