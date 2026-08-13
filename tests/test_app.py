@@ -24,19 +24,6 @@ class AtlasTestCase(unittest.TestCase):
         modulo.rate_limiter = modulo.InMemoryRateLimiter(10_000)
         modulo.iniciar_banco()
         self.cliente = modulo.app.test_client()
-        cadastro = self.cliente.post("/cadastro", json={
-            "nome": "Usuário Teste", "email": "teste@example.com", "senha": "SenhaSegura123"
-        })
-        self.assertEqual(cadastro.status_code, 201, cadastro.get_json())
-        self.csrf = cadastro.get_json()["csrf_token"]
-        abrir_original = self.cliente.open
-        def abrir_com_csrf(*args, **kwargs):
-            metodo = str(kwargs.get("method", "GET")).upper()
-            if metodo not in {"GET", "HEAD", "OPTIONS"}:
-                cabecalhos = kwargs.setdefault("headers", {})
-                cabecalhos.setdefault("X-CSRF-Token", self.csrf)
-            return abrir_original(*args, **kwargs)
-        self.cliente.open = abrir_com_csrf
         self.conversa = self.cliente.post("/conversas").get_json()["id"]
 
     def tearDown(self):
@@ -88,10 +75,6 @@ class AtlasTestCase(unittest.TestCase):
             "arquivo": (self.csv_treino(10), "novos.csv")
         }, content_type="multipart/form-data")
         self.assertEqual(previsao.status_code, 200, previsao.get_json())
-        download = previsao.get_json()["download"]
-        outro = modulo.app.test_client()
-        outro.post("/cadastro", json={"nome": "Intruso", "email": "intruso@example.com", "senha": "SenhaIntruso123"})
-        self.assertEqual(outro.get(download).status_code, 404)
 
     def test_rejeita_conversa_invalida(self):
         resposta = self.cliente.post("/upload", data={
@@ -160,36 +143,6 @@ class AtlasTestCase(unittest.TestCase):
         }, content_type="multipart/form-data")
         self.assertEqual(resposta.status_code, 400)
         self.assertIn("Faltam colunas", resposta.get_json()["erro"])
-
-    def test_exige_login(self):
-        anonimo = modulo.app.test_client()
-        self.assertEqual(anonimo.get("/conversas").status_code, 401)
-
-    def test_isola_conversas_por_usuario(self):
-        outro = modulo.app.test_client()
-        cadastro = outro.post("/cadastro", json={
-            "nome": "Outra Pessoa", "email": "outra@example.com", "senha": "OutraSenha123"
-        })
-        token = cadastro.get_json()["csrf_token"]
-        resposta = outro.get(f"/conversas/{self.conversa}/mensagens")
-        self.assertEqual(resposta.status_code, 404)
-        lista = outro.get("/conversas").get_json()
-        self.assertEqual(lista, [])
-        logout = outro.post("/logout", headers={"X-CSRF-Token": token})
-        self.assertEqual(logout.status_code, 204)
-
-    def test_rejeita_post_sem_csrf(self):
-        cliente = modulo.app.test_client()
-        login = cliente.post("/login", json={"email": "teste@example.com", "senha": "SenhaSegura123"})
-        self.assertEqual(login.status_code, 200)
-        self.assertEqual(cliente.post("/conversas").status_code, 403)
-
-    def test_senha_fraca_e_rejeitada(self):
-        cliente = modulo.app.test_client()
-        resposta = cliente.post("/cadastro", json={
-            "nome": "Fraco", "email": "fraco@example.com", "senha": "123"
-        })
-        self.assertEqual(resposta.status_code, 400)
 
     def test_neutraliza_formula_em_csv(self):
         quadro = pd.DataFrame({"valor": ["=WEBSERVICE(\"https://exemplo.test\")", "+1", "texto"]})

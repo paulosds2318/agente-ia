@@ -2,7 +2,7 @@
 
 ## Escopo
 
-O Atlas possui login e isolamento por proprietário, mas não deve ser exposto diretamente à internet sem TLS, servidor WSGI e revisão de infraestrutura.
+O Atlas não possui autenticação. Use-o localmente ou em rede privada confiável e não o exponha diretamente à internet.
 
 ## Proteção de dados
 
@@ -16,18 +16,13 @@ O Atlas possui login e isolamento por proprietário, mas não deve ser exposto d
 
 ## Defesas disponíveis
 
-- login com senha armazenada por hash e sessões HttpOnly;
-- autorização por proprietário em conversas, tarefas e previsões;
-- proteção CSRF em operações de escrita;
 - limitação de requisições por endereço;
 - Content Security Policy e cabeçalhos restritivos;
 - expiração automática dos CSVs de previsão;
 - envio de amostras categóricas à IA desativado por padrão;
 - logs sem conteúdo de planilhas ou credenciais.
 
-Use `ATLAS_SECRET_KEY` persistente e aleatória. Em HTTPS, configure `SESSION_COOKIE_SECURE=true`.
-
-No Render, esses valores são definidos pelo Blueprint. Nunca copie a chave Gemini
+No Render, nunca copie a chave Gemini
 para `render.yaml`; configure-a como secret no Dashboard. O disco persistente mantém
 dados entre deploys, portanto aplique também backups e uma política de retenção.
 
@@ -35,4 +30,4 @@ Não abra uma issue pública contendo credenciais, dados pessoais ou detalhes ex
 
 ## Produção
 
-Antes de uso público, adicione TLS, rate limiting compartilhado, auditoria, armazenamento externo de tarefas e backups protegidos.
+Antes de uso público, implemente autenticação e autorização, além de TLS, rate limiting compartilhado, auditoria, armazenamento externo de tarefas e backups protegidos.

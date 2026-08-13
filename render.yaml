@@ -15,17 +15,11 @@ services:
         value: "true"
       - key: ATLAS_DATA_DIR
         value: /var/data
-      - key: ATLAS_SECRET_KEY
-        generateValue: true
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
         value: gemini-3.6-flash
       - key: FLASK_DEBUG
-        value: "false"
-      - key: SESSION_COOKIE_SECURE
-        value: "true"
-      - key: ALLOW_REGISTRATION
         value: "false"
       - key: MAX_PENDING_TASKS
         value: "4"

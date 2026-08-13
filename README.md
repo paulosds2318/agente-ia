@@ -40,17 +40,11 @@ Configurações opcionais:
 
 ```env
 GEMINI_MODEL=gemini-3.6-flash
-ATLAS_SECRET_KEY=gere_um_valor_aleatorio_longo
-ALLOW_REGISTRATION=true
 MAX_PENDING_TASKS=4
 RATE_LIMIT_PER_MINUTE=60
 ARTIFACT_TTL_HOURS=24
 SEND_DATA_SAMPLES=false
 ```
-
-No primeiro acesso, crie a primeira conta. Ela herdará as conversas locais antigas.
-Cada conta criada depois terá conversas, tarefas, modelos e previsões isolados. Para
-fechar novos cadastros, defina `ALLOW_REGISTRATION=false` após criar as contas desejadas.
 
 Por padrão, valores categóricos da planilha não são enviados à IA. Ative
 `SEND_DATA_SAMPLES=true` somente quando isso for aceitável para os dados tratados.
@@ -71,12 +65,11 @@ O repositório inclui `render.yaml` com Gunicorn, health check e disco persisten
 2. No Render, escolha **New > Blueprint** e conecte o repositório.
 3. Informe `GEMINI_API_KEY` quando o Blueprint solicitar.
 4. Aguarde o health check em `/saude` ficar saudável.
-5. Abra a URL `onrender.com` e crie a primeira conta.
+5. Abra a URL `onrender.com`.
 
 O Blueprint usa uma instância `starter` com disco de 1 GB em `/var/data`. Isso é
-intencional: SQLite, contas, conversas, uploads e modelos seriam apagados a cada
-deploy no filesystem efêmero. A primeira conta pode ser criada mesmo com
-`ALLOW_REGISTRATION=false`; depois dela, novos cadastros ficam fechados.
+intencional: SQLite, conversas, uploads e modelos seriam apagados a cada deploy
+no filesystem efêmero.
 
 O serviço usa um único worker Gunicorn porque SQLite e o executor local não podem
 ser escalados horizontalmente com segurança. Para múltiplas instâncias, migre o

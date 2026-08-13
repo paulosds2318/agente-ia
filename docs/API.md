@@ -2,17 +2,7 @@
 
 Todas as respostas de erro usam o formato `{"erro": "mensagem"}`.
 
-As rotas privadas exigem cookie de sessão. Operações de escrita também exigem o
-cabeçalho `X-CSRF-Token`, obtido em `POST /login`, `POST /cadastro` ou `GET /sessao`.
-
-## Autenticação
-
-- `POST /cadastro`: cria uma conta conforme `ALLOW_REGISTRATION`.
-- `POST /login`: inicia uma sessão.
-- `GET /sessao`: retorna usuário e token CSRF.
-- `POST /logout`: encerra a sessão.
-
-Todos os recursos são filtrados pelo proprietário autenticado.
+As rotas não exigem autenticação. Todas as conversas pertencem à instância compartilhada.
 
 ## Operação
 

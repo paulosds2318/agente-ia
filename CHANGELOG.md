@@ -4,11 +4,10 @@
 
 - Corrige arquivos contaminados e normaliza UTF-8.
 - Modulariza configuração, integração Gemini e segurança HTTP.
-- Adiciona autenticação opcional, rate limiting, CSP e expiração de previsões.
+- Adiciona rate limiting, CSP e expiração de previsões.
 - Retoma e permite cancelar tarefas persistidas.
 - Seleciona modelos pela validação cruzada e registra baseline e rastreabilidade.
 - Amplia a suíte automatizada para dez cenários.
-- Adiciona contas, sessões, CSRF e isolamento completo por proprietário.
 - Protege downloads, modelos serializados, CSVs e planilhas compactadas.
 - Limita a fila e preserva consistência entre a versão da base e o modelo.
 - Adiciona CI com testes, auditoria de dependências e detecção de segredos.
