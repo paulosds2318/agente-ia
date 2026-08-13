@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 # Atlas — Agente de Dados
 
 Aplicação web local para conversar com uma IA sobre bases tabulares, diagnosticar qualidade de dados, treinar modelos de machine learning e gerar previsões em lote.

@@ -1,7 +1,3 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Total output lines: 1021
-Output:
 from flask import Flask, render_template, request, jsonify, g, send_file
 from google import genai
 from dotenv import load_dotenv
@@ -48,9 +44,17 @@ os.makedirs(MODEL_FOLDER, exist_ok=True)
 os.makedirs(PREDICTION_FOLDER, exist_ok=True)
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="atlas-ml")
 
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+client = None
+
+
+def obter_cliente_ia():
+    global client
+    if client is None:
+        chave = os.getenv("GEMINI_API_KEY")
+        if not chave:
+            raise ValueError("GEMINI_API_KEY não configurada.")
+        client = genai.Client(api_key=chave)
+    return client
 
 
 @app.after_request
@@ -601,7 +605,19 @@ def upload_legado():
 
             "qualidade": {
 
-                …141 tokens truncated…rn jsonify({
+                "total_colunas": total_colunas,
+                "total_nulos": total_nulos,
+                "percentual_nulos": percentual_nulos,
+                "duplicados": duplicados,
+                "colunas_vazias": colunas_vazias,
+                "nulos_por_coluna": nulos_por_coluna,
+                "tipos": tipos_colunas
+            }
+        })
+
+    except (ValueError, pd.errors.EmptyDataError):
+
+        return jsonify({
             "erro": "O arquivo não possui dados válidos."
         }), 400
 
@@ -705,8 +721,8 @@ Regras:
             f"\n\nContexto e solicitação atual:\n{contexto}"
         )
 
-        conversa_chat = client.chats.create(
-            model="gemini-3.6-flash"
+        conversa_chat = obter_cliente_ia().chats.create(
+            model="gemini-3.5-flash-lite"
         )
 
         resposta = conversa_chat.send_message(
@@ -957,7 +973,7 @@ def perguntar():
         historico = obter_banco().execute("SELECT autor, conteudo FROM mensagens WHERE conversa_id=? ORDER BY id DESC LIMIT 12", (conversa_id,)).fetchall()
         contexto = "Você é um assistente de análise de dados. Responda em português, sem inventar valores.\n" + contexto_dados
         contexto += "\nHistórico:\n" + "\n".join(f"{m['autor']}: {m['conteudo']}" for m in reversed(historico))
-        resposta = client.chats.create(model="gemini-3.6-flash").send_message(contexto)
+        resposta = obter_cliente_ia().chats.create(model="gemini-3.5-flash-lite").send_message(contexto)
         if not resposta.text: raise RuntimeError("A IA retornou uma resposta vazia.")
         salvar_mensagem(conversa_id, "agente", resposta.text)
         banco = obter_banco(); banco.execute("UPDATE mensagens SET status='concluida', erro=NULL WHERE id=?", (mensagem_id,))
@@ -997,4 +1013,3 @@ iniciar_banco()
 
 if __name__ == "__main__":
     app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
-
