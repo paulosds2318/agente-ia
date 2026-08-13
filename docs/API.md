@@ -2,8 +2,17 @@
 
 Todas as respostas de erro usam o formato `{"erro": "mensagem"}`.
 
-Quando `ATLAS_ACCESS_TOKEN` estiver configurado, envie `X-Atlas-Token` em todas
-as rotas, exceto `/` e `/saude`.
+As rotas privadas exigem cookie de sessão. Operações de escrita também exigem o
+cabeçalho `X-CSRF-Token`, obtido em `POST /login`, `POST /cadastro` ou `GET /sessao`.
+
+## Autenticação
+
+- `POST /cadastro`: cria uma conta conforme `ALLOW_REGISTRATION`.
+- `POST /login`: inicia uma sessão.
+- `GET /sessao`: retorna usuário e token CSRF.
+- `POST /logout`: encerra a sessão.
+
+Todos os recursos são filtrados pelo proprietário autenticado.
 
 ## Operação
 
@@ -69,4 +78,3 @@ Solicita o cancelamento de uma tarefa pendente ou em processamento.
 ### `GET /previsoes/<token>`
 
 Baixa o CSV produzido pela previsão.
-

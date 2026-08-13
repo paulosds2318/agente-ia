@@ -40,17 +40,17 @@ Configurações opcionais:
 
 ```env
 GEMINI_MODEL=gemini-3.6-flash
-ATLAS_ACCESS_TOKEN=
+ATLAS_SECRET_KEY=gere_um_valor_aleatorio_longo
+ALLOW_REGISTRATION=true
+MAX_PENDING_TASKS=4
 RATE_LIMIT_PER_MINUTE=60
 ARTIFACT_TTL_HOURS=24
 SEND_DATA_SAMPLES=false
 ```
 
-Quando `ATLAS_ACCESS_TOKEN` estiver definido, informe o token no navegador uma vez:
-
-```javascript
-localStorage.setItem("atlas_access_token", "seu-token")
-```
+No primeiro acesso, crie a primeira conta. Ela herdará as conversas locais antigas.
+Cada conta criada depois terá conversas, tarefas, modelos e previsões isolados. Para
+fechar novos cadastros, defina `ALLOW_REGISTRATION=false` após criar as contas desejadas.
 
 Por padrão, valores categóricos da planilha não são enviados à IA. Ative
 `SEND_DATA_SAMPLES=true` somente quando isso for aceitável para os dados tratados.
@@ -115,10 +115,10 @@ Consulte [Arquitetura](docs/ARCHITECTURE.md), [API](docs/API.md), [Segurança](S
 
 ## Limitações atuais
 
-- Projetado para execução local e usuário único.
+- Projetado prioritariamente para execução local ou em rede privada confiável.
 - SQLite e o executor local não são indicados para múltiplas instâncias.
 - Tarefas são retomadas, mas exigem uma fila distribuída em múltiplas instâncias.
-- A autenticação por token não substitui contas e autorização por usuário.
+- Para exposição pública, ainda são necessários TLS, servidor WSGI e proteção de infraestrutura.
 - A disponibilidade do chat depende da cota da API Gemini.
 
 ## Licença

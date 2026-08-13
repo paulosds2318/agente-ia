@@ -1,6 +1,7 @@
-from flask import Flask, render_template, request, jsonify, g, send_file
+from flask import Flask, render_template, request, jsonify, g, send_file, session, has_request_context
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash, check_password_hash
 import pandas as pd
 import os
 import sqlite3
@@ -8,6 +9,10 @@ import json
 import hmac
 import io
 import csv
+import hashlib
+import secrets
+import threading
+import zipfile
 import uuid
 import time
 from datetime import datetime, timezone, timedelta
@@ -31,6 +36,8 @@ from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_s
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from openpyxl import load_workbook
+import re
 
 load_dotenv()
 settings = Settings.from_env()
@@ -42,6 +49,13 @@ logger = logging.getLogger("atlas")
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+app.config.update(
+    SECRET_KEY=settings.secret_key,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 os.makedirs(app.instance_path, exist_ok=True)
 BANCO_DADOS = os.path.join(app.instance_path, "conversas.db")
 
@@ -59,6 +73,7 @@ os.makedirs(MODEL_FOLDER, exist_ok=True)
 os.makedirs(PREDICTION_FOLDER, exist_ok=True)
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="atlas-ml")
 rate_limiter = InMemoryRateLimiter(settings.rate_limit_per_minute)
+task_slots = threading.BoundedSemaphore(settings.max_pending_tasks)
 
 
 @app.after_request
@@ -68,19 +83,29 @@ def cabecalhos_seguranca(resposta):
 
 @app.before_request
 def limitar_requisicoes():
-    if request.endpoint in {"inicio", "static", "saude"}:
-        return None
-    if settings.access_token:
-        informado = request.headers.get("X-Atlas-Token", "")
-        if not hmac.compare_digest(informado, settings.access_token):
-            return jsonify({"erro": "Autenticação necessária."}), 401
-    return rate_limiter.check()
+    publicos = {"inicio", "static", "saude", "login", "cadastro"}
+    if request.endpoint in publicos:
+        return rate_limiter.check() if request.endpoint in {"login", "cadastro"} else None
+    limitado = rate_limiter.check()
+    if limitado:
+        return limitado
+    if "usuario_id" not in session:
+        return jsonify({"erro": "Autenticação necessária."}), 401
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        informado = request.headers.get("X-CSRF-Token", "")
+        esperado = session.get("csrf_token", "")
+        if not esperado or not hmac.compare_digest(informado, esperado):
+            return jsonify({"erro": "Token CSRF inválido."}), 403
+    g.usuario_id = int(session["usuario_id"])
+    return None
 
 def obter_banco():
     if "banco" not in g:
         g.banco = sqlite3.connect(BANCO_DADOS)
         g.banco.row_factory = sqlite3.Row
         g.banco.execute("PRAGMA foreign_keys = ON")
+        g.banco.execute("PRAGMA journal_mode = WAL")
+        g.banco.execute("PRAGMA busy_timeout = 5000")
     return g.banco
 
 
@@ -95,6 +120,18 @@ def iniciar_banco():
     with app.app_context():
         banco = obter_banco()
         banco.executescript("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                senha_hash TEXT NOT NULL,
+                ativo INTEGER NOT NULL DEFAULT 1,
+                criada_em TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                versao INTEGER PRIMARY KEY,
+                aplicada_em TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS conversas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 titulo TEXT NOT NULL,
@@ -150,7 +187,20 @@ def iniciar_banco():
                 atualizada_em TEXT NOT NULL,
                 FOREIGN KEY (conversa_id) REFERENCES conversas(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS previsoes (
+                token TEXT PRIMARY KEY,
+                usuario_id INTEGER NOT NULL,
+                conversa_id INTEGER NOT NULL,
+                caminho TEXT NOT NULL UNIQUE,
+                criada_em TEXT NOT NULL,
+                expira_em TEXT NOT NULL,
+                FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE,
+                FOREIGN KEY (conversa_id) REFERENCES conversas(id) ON DELETE CASCADE
+            );
         """)
+        colunas_conversas = {item[1] for item in banco.execute("PRAGMA table_info(conversas)")}
+        if "usuario_id" not in colunas_conversas:
+            banco.execute("ALTER TABLE conversas ADD COLUMN usuario_id INTEGER REFERENCES usuarios(id)")
         colunas_mensagens = {item[1] for item in banco.execute("PRAGMA table_info(mensagens)")}
         if "status" not in colunas_mensagens:
             banco.execute("ALTER TABLE mensagens ADD COLUMN status TEXT NOT NULL DEFAULT 'concluida'")
@@ -159,11 +209,93 @@ def iniciar_banco():
         colunas_tarefas = {item[1] for item in banco.execute("PRAGMA table_info(tarefas)")}
         if "requisicao_json" not in colunas_tarefas:
             banco.execute("ALTER TABLE tarefas ADD COLUMN requisicao_json TEXT")
+        colunas_modelos = {item[1] for item in banco.execute("PRAGMA table_info(modelos)")}
+        if "sha256" not in colunas_modelos:
+            banco.execute("ALTER TABLE modelos ADD COLUMN sha256 TEXT")
+        banco.execute("INSERT OR IGNORE INTO schema_migrations(versao,aplicada_em) VALUES(2,?)", (agora_iso(),))
         banco.commit()
 
 
 def agora_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def usuario_atual_id():
+    return int(getattr(g, "usuario_id", session.get("usuario_id", 0)))
+
+
+def csrf_novo():
+    token = secrets.token_urlsafe(32)
+    session["csrf_token"] = token
+    return token
+
+
+def normalizar_email(valor):
+    return str(valor or "").strip().lower()
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    dados = request.get_json(silent=True) or {}
+    email = normalizar_email(dados.get("email"))
+    senha = str(dados.get("senha") or "")
+    usuario = obter_banco().execute(
+        "SELECT * FROM usuarios WHERE email=? AND ativo=1", (email,)
+    ).fetchone()
+    if usuario is None or not check_password_hash(usuario["senha_hash"], senha):
+        return jsonify({"erro": "E-mail ou senha inválidos."}), 401
+    session.clear()
+    session.permanent = True
+    session["usuario_id"] = usuario["id"]
+    return jsonify({"usuario": {"id": usuario["id"], "nome": usuario["nome"], "email": usuario["email"]},
+                    "csrf_token": csrf_novo()})
+
+
+@app.route("/cadastro", methods=["POST"])
+def cadastro():
+    dados = request.get_json(silent=True) or {}
+    nome = str(dados.get("nome") or "").strip()
+    email = normalizar_email(dados.get("email"))
+    senha = str(dados.get("senha") or "")
+    banco = obter_banco()
+    total = banco.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
+    if total and not settings.allow_registration:
+        return jsonify({"erro": "Novos cadastros estão desativados."}), 403
+    if len(nome) < 2 or "@" not in email or len(email) > 254:
+        return jsonify({"erro": "Informe nome e e-mail válidos."}), 400
+    if len(senha) < 12 or senha.lower() == senha or senha.upper() == senha or not any(c.isdigit() for c in senha):
+        return jsonify({"erro": "A senha deve ter 12 caracteres, maiúscula, minúscula e número."}), 400
+    try:
+        agora = agora_iso()
+        cursor = banco.execute(
+            "INSERT INTO usuarios (nome,email,senha_hash,criada_em) VALUES (?,?,?,?)",
+            (nome, email, generate_password_hash(senha), agora),
+        )
+        usuario_id = cursor.lastrowid
+        if total == 0:
+            banco.execute("UPDATE conversas SET usuario_id=? WHERE usuario_id IS NULL", (usuario_id,))
+        banco.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"erro": "Este e-mail já está cadastrado."}), 409
+    session.clear(); session.permanent = True; session["usuario_id"] = usuario_id
+    return jsonify({"usuario": {"id": usuario_id, "nome": nome, "email": email},
+                    "csrf_token": csrf_novo()}), 201
+
+
+@app.route("/sessao")
+def sessao_atual():
+    usuario = obter_banco().execute(
+        "SELECT id,nome,email FROM usuarios WHERE id=? AND ativo=1", (usuario_atual_id(),)
+    ).fetchone()
+    if usuario is None:
+        session.clear(); return jsonify({"erro": "Sessão inválida."}), 401
+    return jsonify({"usuario": dict(usuario), "csrf_token": session.get("csrf_token") or csrf_novo()})
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return "", 204
 
 
 def salvar_mensagem(conversa_id, autor, conteudo, status="concluida", erro=None):
@@ -180,20 +312,30 @@ def salvar_mensagem(conversa_id, autor, conteudo, status="concluida", erro=None)
     return cursor.lastrowid
 
 
-def obter_conversa(conversa_id, banco=None):
+def obter_conversa(conversa_id, banco=None, usuario_id=None):
     banco = banco or obter_banco()
-    return banco.execute("SELECT * FROM conversas WHERE id = ?", (conversa_id,)).fetchone()
+    if usuario_id is None and has_request_context():
+        usuario_id = usuario_atual_id()
+    if usuario_id:
+        return banco.execute("SELECT * FROM conversas WHERE id=? AND usuario_id=?", (conversa_id, usuario_id)).fetchone()
+    return banco.execute("SELECT * FROM conversas WHERE id=?", (conversa_id,)).fetchone()
 
 
-def arquivo_da_conversa(conversa_id, banco=None):
+def arquivo_da_conversa(conversa_id, banco=None, usuario_id=None):
     banco = banco or obter_banco()
+    conversa = obter_conversa(conversa_id, banco, usuario_id)
+    if conversa is None:
+        return None
     return banco.execute(
         "SELECT * FROM arquivos WHERE conversa_id = ? ORDER BY id DESC LIMIT 1", (conversa_id,)
     ).fetchone()
 
 
-def modelo_da_conversa(conversa_id, banco=None):
+def modelo_da_conversa(conversa_id, banco=None, usuario_id=None):
     banco = banco or obter_banco()
+    conversa = obter_conversa(conversa_id, banco, usuario_id)
+    if conversa is None:
+        return None
     return banco.execute(
         "SELECT * FROM modelos WHERE conversa_id = ? ORDER BY id DESC LIMIT 1", (conversa_id,)
     ).fetchone()
@@ -208,6 +350,23 @@ def carregar_dataframe(registro):
 
 def ler_dataframe(fonte, extensao):
     if extensao != "csv":
+        caminho = fonte if isinstance(fonte, (str, os.PathLike)) else None
+        if caminho:
+            try:
+                with zipfile.ZipFile(caminho) as pacote:
+                    total = sum(item.file_size for item in pacote.infolist())
+                    comprimido = max(1, sum(item.compress_size for item in pacote.infolist()))
+                    if total > settings.max_upload_bytes * 20 or total / comprimido > 100:
+                        raise ValueError("A planilha compactada expande além do limite seguro.")
+            except zipfile.BadZipFile as erro:
+                raise ValueError("O arquivo XLSX está corrompido.") from erro
+            livro = load_workbook(caminho, read_only=True, data_only=True)
+            try:
+                for planilha in livro.worksheets:
+                    if planilha.max_row > settings.max_rows + 1 or planilha.max_column > settings.max_columns:
+                        raise ValueError("A planilha excede os limites de linhas ou colunas.")
+            finally:
+                livro.close()
         return pd.read_excel(fonte)
     if hasattr(fonte, "read"):
         bruto = fonte.read()
@@ -243,6 +402,43 @@ def limpar_previsoes_expiradas():
         alterado = datetime.fromtimestamp(item.stat().st_mtime, timezone.utc)
         if alterado < limite:
             remover_arquivo_seguro(str(item), PREDICTION_FOLDER)
+    with app.app_context() if not has_request_context() else _contexto_nulo():
+        banco = obter_banco()
+        banco.execute("DELETE FROM previsoes WHERE expira_em < ?", (agora_iso(),))
+        banco.commit()
+
+
+class _contexto_nulo:
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+
+
+def sha256_arquivo(caminho):
+    digest = hashlib.sha256()
+    with open(caminho, "rb") as arquivo:
+        for bloco in iter(lambda: arquivo.read(1024 * 1024), b""):
+            digest.update(bloco)
+    return digest.hexdigest()
+
+
+def neutralizar_formulas_csv(df):
+    saida = df.copy()
+    for coluna in saida.select_dtypes(include=["object", "string"]).columns:
+        saida[coluna] = saida[coluna].map(
+            lambda valor: "'" + valor if isinstance(valor, str) and valor.lstrip().startswith(("=", "+", "-", "@")) else valor
+        )
+    return saida
+
+
+PADRAO_SENSIVEL = re.compile(r"(cpf|cnpj|e.?mail|email|telefone|celular|senha|token|cart[aã]o|conta|endere[cç]o|nome)", re.I)
+
+
+def dataframe_privado_para_prompt(df):
+    renomear = {}
+    for indice, coluna in enumerate(df.columns, 1):
+        if PADRAO_SENSIVEL.search(str(coluna)):
+            renomear[coluna] = f"[coluna_sensivel_{indice}]"
+    return df.rename(columns=renomear), [str(c) for c in renomear]
 
 
 @app.route("/conversas", methods=["GET"])
@@ -250,8 +446,8 @@ def listar_conversas():
     linhas = obter_banco().execute("""
         SELECT c.id, c.titulo, c.criada_em, c.atualizada_em, COUNT(m.id) AS total_mensagens
         FROM conversas c LEFT JOIN mensagens m ON m.conversa_id = c.id
-        GROUP BY c.id ORDER BY c.atualizada_em DESC
-    """).fetchall()
+        WHERE c.usuario_id=? GROUP BY c.id ORDER BY c.atualizada_em DESC
+    """, (usuario_atual_id(),)).fetchall()
     return jsonify([dict(linha) for linha in linhas])
 
 
@@ -260,8 +456,8 @@ def criar_conversa():
     agora = agora_iso()
     banco = obter_banco()
     cursor = banco.execute(
-        "INSERT INTO conversas (titulo, criada_em, atualizada_em) VALUES (?, ?, ?)",
-        ("Nova conversa", agora, agora)
+        "INSERT INTO conversas (titulo, criada_em, atualizada_em, usuario_id) VALUES (?, ?, ?, ?)",
+        ("Nova conversa", agora, agora, usuario_atual_id())
     )
     banco.commit()
     return jsonify({"id": cursor.lastrowid, "titulo": "Nova conversa"}), 201
@@ -270,7 +466,7 @@ def criar_conversa():
 @app.route("/conversas/<int:conversa_id>/mensagens", methods=["GET"])
 def listar_mensagens(conversa_id):
     banco = obter_banco()
-    conversa = banco.execute("SELECT id, titulo FROM conversas WHERE id = ?", (conversa_id,)).fetchone()
+    conversa = banco.execute("SELECT id, titulo FROM conversas WHERE id=? AND usuario_id=?", (conversa_id, usuario_atual_id())).fetchone()
     if conversa is None:
         return jsonify({"erro": "Conversa não encontrada."}), 404
     mensagens = banco.execute(
@@ -305,9 +501,12 @@ def listar_mensagens(conversa_id):
 @app.route("/conversas/<int:conversa_id>", methods=["DELETE"])
 def excluir_conversa(conversa_id):
     banco = obter_banco()
-    arquivos = banco.execute("SELECT caminho FROM arquivos WHERE conversa_id = ?", (conversa_id,)).fetchall()
-    modelos = banco.execute("SELECT caminho FROM modelos WHERE conversa_id = ?", (conversa_id,)).fetchall()
-    cursor = banco.execute("DELETE FROM conversas WHERE id = ?", (conversa_id,))
+    ativa = banco.execute("SELECT 1 FROM tarefas t JOIN conversas c ON c.id=t.conversa_id WHERE c.id=? AND c.usuario_id=? AND t.status IN ('pendente','processando')", (conversa_id, usuario_atual_id())).fetchone()
+    if ativa: return jsonify({"erro": "Cancele ou aguarde o treinamento antes de excluir a conversa."}), 409
+    arquivos = banco.execute("SELECT caminho FROM arquivos WHERE conversa_id=? AND EXISTS (SELECT 1 FROM conversas WHERE id=? AND usuario_id=?)", (conversa_id, conversa_id, usuario_atual_id())).fetchall()
+    modelos = banco.execute("SELECT caminho FROM modelos WHERE conversa_id=? AND EXISTS (SELECT 1 FROM conversas WHERE id=? AND usuario_id=?)", (conversa_id, conversa_id, usuario_atual_id())).fetchall()
+    previsoes = banco.execute("SELECT caminho FROM previsoes WHERE conversa_id=? AND usuario_id=?", (conversa_id, usuario_atual_id())).fetchall()
+    cursor = banco.execute("DELETE FROM conversas WHERE id=? AND usuario_id=?", (conversa_id, usuario_atual_id()))
     banco.commit()
     if cursor.rowcount == 0:
         return jsonify({"erro": "Conversa não encontrada."}), 404
@@ -315,6 +514,8 @@ def excluir_conversa(conversa_id):
         remover_arquivo_seguro(item["caminho"], UPLOAD_FOLDER)
     for item in modelos:
         remover_arquivo_seguro(item["caminho"], MODEL_FOLDER)
+    for item in previsoes:
+        remover_arquivo_seguro(item["caminho"], PREDICTION_FOLDER)
     return "", 204
 
 
@@ -454,6 +655,8 @@ def preparar_treinamento(df, alvo):
 
 @app.route("/")
 def inicio():
+    if "usuario_id" not in session:
+        return render_template("login.html", cadastro_ativo=settings.allow_registration)
     return render_template("index.html")
 
 
@@ -482,6 +685,8 @@ def upload():
     conversa_id = request.form.get("conversa_id", type=int)
     if not conversa_id or obter_conversa(conversa_id) is None:
         return jsonify({"erro": "Conversa inválida."}), 400
+    ativa = obter_banco().execute("SELECT 1 FROM tarefas WHERE conversa_id=? AND status IN ('pendente','processando')", (conversa_id,)).fetchone()
+    if ativa: return jsonify({"erro": "Aguarde ou cancele o treinamento antes de substituir a base."}), 409
     arquivo = request.files.get("arquivo")
     if not arquivo or not arquivo.filename:
         return jsonify({"erro": "Selecione um arquivo."}), 400
@@ -534,10 +739,18 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
     with app.app_context():
         banco = obter_banco()
         try:
+            estado = banco.execute("SELECT status FROM tarefas WHERE id=?", (tarefa_id,)).fetchone()
+            if estado is None or estado["status"] == "cancelada":
+                return
             banco.execute("UPDATE tarefas SET status='processando', progresso=10, atualizada_em=? WHERE id=?",
                           (agora_iso(), tarefa_id)); banco.commit()
-            arquivo = arquivo_da_conversa(conversa_id, banco)
+            tarefa = banco.execute("SELECT requisicao_json FROM tarefas WHERE id=?", (tarefa_id,)).fetchone()
+            requisicao = json.loads(tarefa["requisicao_json"] or "{}")
+            arquivo_id_esperado = requisicao.get("arquivo_id")
+            arquivo = arquivo_da_conversa(conversa_id, banco, usuario_id=0)
             if arquivo is None: raise ValueError("Envie uma base antes de treinar.")
+            if arquivo_id_esperado and arquivo["id"] != arquivo_id_esperado:
+                raise ValueError("A base foi substituída durante o treinamento.")
             df = carregar_dataframe(arquivo)
             x, y, preparador, classificacao, descartadas = preparar_treinamento(df, alvo)
             contagens = y.value_counts()
@@ -610,11 +823,12 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
                     key=lambda item: item["importancia"], reverse=True
                 )[:15]
             caminho_modelo = os.path.join(MODEL_FOLDER, f"{conversa_id}_{uuid.uuid4().hex}.joblib")
-            pacote = {"pipeline": melhor, "colunas": list(x.columns), "alvo": alvo,
+            pacote = {"pipeline": melhor, "colunas": list(x.columns), "tipos": {str(c): str(x[c].dtype) for c in x.columns}, "alvo": alvo,
                       "tipo": "classificação" if classificacao else "regressão",
                       "versoes": {"python": platform.python_version(), "sklearn": sklearn.__version__},
-                      "treinado_em": agora_iso()}
+                      "treinado_em": agora_iso(), "dataset_sha256": sha256_arquivo(arquivo["caminho"])}
             joblib.dump(pacote, caminho_modelo)
+            hash_modelo = sha256_arquivo(caminho_modelo)
             resultado = {"tipo": pacote["tipo"], "alvo": alvo, "linhas_treino": len(x_tr),
                          "linhas_teste": len(x_te), "recursos": x.shape[1], "avisos": avisos,
                          "colunas_descartadas": descartadas, "melhor_modelo": melhor_nome,
@@ -622,12 +836,16 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
                          "possivel_vazamento": suspeitas_vazamento,
                          "importancia_recursos": importancia, "versoes": pacote["versoes"],
                          "resultados": resultados}
+            atual = arquivo_da_conversa(conversa_id, banco, usuario_id=0)
+            if atual is None or atual["id"] != arquivo["id"]:
+                remover_arquivo_seguro(caminho_modelo, MODEL_FOLDER)
+                raise ValueError("A base mudou antes da conclusão; o modelo foi descartado.")
             antigos = banco.execute("SELECT caminho FROM modelos WHERE conversa_id=?", (conversa_id,)).fetchall()
             banco.execute("DELETE FROM modelos WHERE conversa_id=?", (conversa_id,))
             banco.execute("""INSERT INTO modelos (conversa_id, arquivo_id, alvo, tipo, nome, caminho,
-                              recursos_json, metricas_json, criada_em) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                              recursos_json, metricas_json, criada_em, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                           (conversa_id, arquivo["id"], alvo, pacote["tipo"], melhor_nome, caminho_modelo,
-                           json.dumps(list(x.columns), ensure_ascii=False), json.dumps(resultado, ensure_ascii=False), agora_iso()))
+                           json.dumps(list(x.columns), ensure_ascii=False), json.dumps(resultado, ensure_ascii=False), agora_iso(), hash_modelo))
             banco.execute("UPDATE tarefas SET status='concluida', progresso=100, resultado_json=?, atualizada_em=? WHERE id=?",
                           (json.dumps(resultado, ensure_ascii=False), agora_iso(), tarefa_id)); banco.commit()
             for item in antigos: remover_arquivo_seguro(item["caminho"], MODEL_FOLDER)
@@ -635,6 +853,8 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
             logger.exception("Falha no treinamento", extra={"tarefa_id": tarefa_id, "conversa_id": conversa_id})
             banco.execute("UPDATE tarefas SET status='falhou', erro=?, atualizada_em=? WHERE id=?",
                           (str(erro), agora_iso(), tarefa_id)); banco.commit()
+        finally:
+            task_slots.release()
 
 
 @app.route("/treinar", methods=["POST"])
@@ -644,16 +864,24 @@ def treinar():
         return jsonify({"erro": "Conversa inválida."}), 400
     if not alvo: return jsonify({"erro": "Selecione a coluna que deseja prever."}), 400
     if arquivo_da_conversa(conversa_id) is None: return jsonify({"erro": "Envie uma base antes de treinar."}), 400
+    if not task_slots.acquire(blocking=False):
+        return jsonify({"erro": "A fila de treinamento está cheia. Tente novamente mais tarde."}), 503
     tarefa_id = uuid.uuid4().hex; agora = agora_iso(); banco = obter_banco()
-    banco.execute("INSERT INTO tarefas (id, conversa_id, tipo, status, progresso, criada_em, atualizada_em, requisicao_json) VALUES (?,?,'treinamento','pendente',0,?,?,?)",
-                  (tarefa_id, conversa_id, agora, agora, json.dumps({"alvo": alvo}, ensure_ascii=False))); banco.commit()
-    executor.submit(executar_treinamento, tarefa_id, conversa_id, alvo)
+    arquivo_id = arquivo_da_conversa(conversa_id)["id"]
+    try:
+        banco.execute("INSERT INTO tarefas (id, conversa_id, tipo, status, progresso, criada_em, atualizada_em, requisicao_json) VALUES (?,?,'treinamento','pendente',0,?,?,?)",
+                      (tarefa_id, conversa_id, agora, agora, json.dumps({"alvo": alvo, "arquivo_id": arquivo_id}, ensure_ascii=False)))
+        banco.commit()
+        executor.submit(executar_treinamento, tarefa_id, conversa_id, alvo)
+    except Exception:
+        task_slots.release()
+        raise
     return jsonify({"tarefa_id": tarefa_id, "status": "pendente"}), 202
 
 
 @app.route("/tarefas/<tarefa_id>")
 def consultar_tarefa(tarefa_id):
-    tarefa = obter_banco().execute("SELECT * FROM tarefas WHERE id=?", (tarefa_id,)).fetchone()
+    tarefa = obter_banco().execute("SELECT t.* FROM tarefas t JOIN conversas c ON c.id=t.conversa_id WHERE t.id=? AND c.usuario_id=?", (tarefa_id, usuario_atual_id())).fetchone()
     if tarefa is None: return jsonify({"erro": "Tarefa não encontrada."}), 404
     dados = dict(tarefa); dados["resultado"] = json.loads(dados.pop("resultado_json")) if dados["resultado_json"] else None
     return jsonify(dados)
@@ -663,8 +891,8 @@ def consultar_tarefa(tarefa_id):
 def cancelar_tarefa(tarefa_id):
     banco = obter_banco()
     cursor = banco.execute(
-        "UPDATE tarefas SET status='cancelada', atualizada_em=? WHERE id=? AND status IN ('pendente','processando')",
-        (agora_iso(), tarefa_id),
+        "UPDATE tarefas SET status='cancelada', atualizada_em=? WHERE id=? AND status IN ('pendente','processando') AND EXISTS (SELECT 1 FROM conversas c WHERE c.id=tarefas.conversa_id AND c.usuario_id=?)",
+        (agora_iso(), tarefa_id, usuario_atual_id()),
     )
     banco.commit()
     if cursor.rowcount == 0:
@@ -682,15 +910,31 @@ def prever():
     try:
         extensao = "csv" if arquivo.filename.lower().endswith(".csv") else "xlsx"
         entrada = ler_dataframe(arquivo, extensao)
+        if not modelo["sha256"] or not hmac.compare_digest(modelo["sha256"], sha256_arquivo(modelo["caminho"])):
+            return jsonify({"erro": "O artefato do modelo falhou na verificação de integridade."}), 409
         pacote = joblib.load(modelo["caminho"]); ausentes = [c for c in pacote["colunas"] if c not in entrada.columns]
         if ausentes: return jsonify({"erro": "Faltam colunas: " + ", ".join(map(str, ausentes))}), 400
+        incompatíveis = []
+        for coluna in pacote["colunas"]:
+            esperado_numerico = pacote.get("tipos", {}).get(str(coluna), "").startswith(("int", "float"))
+            if esperado_numerico and not pd.api.types.is_numeric_dtype(entrada[coluna]):
+                incompatíveis.append(str(coluna))
+        if incompatíveis:
+            return jsonify({"erro": "Tipos incompatíveis nas colunas: " + ", ".join(incompatíveis)}), 400
         previsoes = pacote["pipeline"].predict(entrada[pacote["colunas"]]); saida = entrada.copy()
         saida[f"previsao_{pacote['alvo']}"] = previsoes
         if pacote["tipo"] == "classificação" and hasattr(pacote["pipeline"], "predict_proba"):
             probabilidades = pacote["pipeline"].predict_proba(entrada[pacote["colunas"]])
             saida["confianca_previsao"] = probabilidades.max(axis=1)
         token = uuid.uuid4().hex; caminho = os.path.join(PREDICTION_FOLDER, f"{token}.csv")
-        saida.to_csv(caminho, index=False, encoding="utf-8-sig")
+        neutralizar_formulas_csv(saida).to_csv(caminho, index=False, encoding="utf-8-sig")
+        agora = datetime.now(timezone.utc)
+        obter_banco().execute(
+            "INSERT INTO previsoes(token,usuario_id,conversa_id,caminho,criada_em,expira_em) VALUES(?,?,?,?,?,?)",
+            (token, usuario_atual_id(), conversa_id, caminho, agora.isoformat(),
+             (agora + timedelta(hours=settings.artifact_ttl_hours)).isoformat()),
+        )
+        obter_banco().commit()
         return jsonify({"mensagem": f"{len(saida)} previsões geradas.", "download": f"/previsoes/{token}"})
     except Exception as erro:
         logger.exception("Falha na previsão", extra={"conversa_id": conversa_id})
@@ -701,7 +945,9 @@ def prever():
 def baixar_previsao(token):
     limpar_previsoes_expiradas()
     if not token.isalnum(): return jsonify({"erro": "Arquivo inválido."}), 400
-    caminho = os.path.join(PREDICTION_FOLDER, f"{token}.csv")
+    registro = obter_banco().execute("SELECT caminho FROM previsoes WHERE token=? AND usuario_id=? AND expira_em>=?", (token, usuario_atual_id(), agora_iso())).fetchone()
+    if registro is None: return jsonify({"erro": "Previsão não encontrada."}), 404
+    caminho = registro["caminho"]
     if not os.path.isfile(caminho): return jsonify({"erro": "Previsão não encontrada."}), 404
     return send_file(caminho, as_attachment=True, download_name="previsoes.csv")
 
@@ -717,7 +963,10 @@ def perguntar():
         registro = arquivo_da_conversa(conversa_id); contexto_dados = ""
         if registro:
             df = carregar_dataframe(registro)
-            contexto_dados = f"\nBase carregada: {registro['nome_original']}\n{gerar_resumo_dataframe(df)}\n"
+            df_prompt, sensiveis = dataframe_privado_para_prompt(df)
+            contexto_dados = f"\nBase carregada.\n{gerar_resumo_dataframe(df_prompt)}\n"
+            if sensiveis:
+                contexto_dados += "\nAlguns nomes de colunas foram ocultados por privacidade.\n"
         historico = obter_banco().execute("SELECT autor, conteudo FROM mensagens WHERE conversa_id=? ORDER BY id DESC LIMIT 12", (conversa_id,)).fetchall()
         contexto = "Você é um assistente de análise de dados. Responda em português, sem inventar valores.\n" + contexto_dados
         contexto += "\nHistórico:\n" + "\n".join(f"{m['autor']}: {m['conteudo']}" for m in reversed(historico))
@@ -740,7 +989,7 @@ def perguntar():
 
 @app.route("/mensagens/<int:mensagem_id>/tentar-novamente", methods=["POST"])
 def tentar_novamente(mensagem_id):
-    item = obter_banco().execute("SELECT conversa_id, conteudo, status FROM mensagens WHERE id=? AND autor='usuario'", (mensagem_id,)).fetchone()
+    item = obter_banco().execute("SELECT m.conversa_id, m.conteudo, m.status FROM mensagens m JOIN conversas c ON c.id=m.conversa_id WHERE m.id=? AND m.autor='usuario' AND c.usuario_id=?", (mensagem_id, usuario_atual_id())).fetchone()
     if item is None: return jsonify({"erro": "Mensagem não encontrada."}), 404
     obter_banco().execute("DELETE FROM mensagens WHERE id=?", (mensagem_id,)); obter_banco().commit()
     with app.test_request_context(json={"conversa_id": item["conversa_id"], "mensagem": item["conteudo"]}):
@@ -769,6 +1018,10 @@ def recuperar_tarefas_pendentes():
             requisicao = json.loads(tarefa["requisicao_json"] or "{}")
             alvo = requisicao.get("alvo")
             if alvo:
+                if not task_slots.acquire(blocking=False):
+                    banco.execute("UPDATE tarefas SET status='falhou', erro=?, atualizada_em=? WHERE id=?",
+                                  ("Fila cheia durante a recuperação.", agora_iso(), tarefa["id"]))
+                    continue
                 banco.execute(
                     "UPDATE tarefas SET status='pendente', progresso=0, atualizada_em=? WHERE id=?",
                     (agora_iso(), tarefa["id"]),
@@ -786,4 +1039,8 @@ recuperar_tarefas_pendentes()
 
 
 if __name__ == "__main__":
-    app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
+    host = os.getenv("ATLAS_HOST", "127.0.0.1")
+    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    if host not in {"127.0.0.1", "localhost", "::1"} and (debug or not os.getenv("ATLAS_SECRET_KEY")):
+        raise RuntimeError("Uso em rede exige ATLAS_SECRET_KEY persistente e FLASK_DEBUG=false.")
+    app.run(host=host, debug=debug)

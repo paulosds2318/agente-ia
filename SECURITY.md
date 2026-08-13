@@ -2,7 +2,7 @@
 
 ## Escopo
 
-O Atlas foi projetado para uso local por uma pessoa. Não exponha diretamente o servidor Flask à internet sem autenticação, TLS, controle de acesso, servidor WSGI e revisão de segurança.
+O Atlas possui login e isolamento por proprietário, mas não deve ser exposto diretamente à internet sem TLS, servidor WSGI e revisão de infraestrutura.
 
 ## Proteção de dados
 
@@ -16,18 +16,19 @@ O Atlas foi projetado para uso local por uma pessoa. Não exponha diretamente o 
 
 ## Defesas disponíveis
 
-- autenticação opcional por `ATLAS_ACCESS_TOKEN`;
+- login com senha armazenada por hash e sessões HttpOnly;
+- autorização por proprietário em conversas, tarefas e previsões;
+- proteção CSRF em operações de escrita;
 - limitação de requisições por endereço;
 - Content Security Policy e cabeçalhos restritivos;
 - expiração automática dos CSVs de previsão;
 - envio de amostras categóricas à IA desativado por padrão;
 - logs sem conteúdo de planilhas ou credenciais.
 
-O token local é uma proteção simples, não um sistema completo de autorização.
+Use `ATLAS_SECRET_KEY` persistente e aleatória. Em HTTPS, configure `SESSION_COOKIE_SECURE=true`.
 
 Não abra uma issue pública contendo credenciais, dados pessoais ou detalhes exploráveis. Entre em contato privadamente com o mantenedor do repositório.
 
 ## Produção
 
-Antes de uso multiusuário, implemente autenticação, autorização por proprietário, CSRF, rate limiting, auditoria, criptografia adequada, armazenamento externo de tarefas e backups protegidos.
-
+Antes de uso público, adicione TLS, rate limiting compartilhado, auditoria, armazenamento externo de tarefas e backups protegidos.

@@ -8,6 +8,10 @@
 - Retoma e permite cancelar tarefas persistidas.
 - Seleciona modelos pela validação cruzada e registra baseline e rastreabilidade.
 - Amplia a suíte automatizada para dez cenários.
+- Adiciona contas, sessões, CSRF e isolamento completo por proprietário.
+- Protege downloads, modelos serializados, CSVs e planilhas compactadas.
+- Limita a fila e preserva consistência entre a versão da base e o modelo.
+- Adiciona CI com testes, auditoria de dependências e detecção de segredos.
 
 ## 1.0.0 — 2026-08-13
 

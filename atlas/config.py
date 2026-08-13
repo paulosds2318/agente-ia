@@ -20,7 +20,9 @@ class Settings:
     artifact_ttl_hours: int
     rate_limit_per_minute: int
     send_data_samples: bool
-    access_token: str | None
+    secret_key: str
+    max_pending_tasks: int
+    allow_registration: bool
 
     @classmethod
     def from_env(cls):
@@ -34,7 +36,9 @@ class Settings:
             artifact_ttl_hours=_inteiro("ARTIFACT_TTL_HOURS", 24),
             rate_limit_per_minute=_inteiro("RATE_LIMIT_PER_MINUTE", 60),
             send_data_samples=os.getenv("SEND_DATA_SAMPLES", "false").lower() == "true",
-            access_token=os.getenv("ATLAS_ACCESS_TOKEN") or None,
+            secret_key=os.getenv("ATLAS_SECRET_KEY") or os.urandom(32).hex(),
+            max_pending_tasks=_inteiro("MAX_PENDING_TASKS", 4),
+            allow_registration=os.getenv("ALLOW_REGISTRATION", "true").lower() == "true",
         )
 
     def public_status(self):
@@ -42,5 +46,5 @@ class Settings:
             "gemini_configurado": bool(self.gemini_api_key),
             "modelo": self.gemini_model,
             "envio_amostras": self.send_data_samples,
-            "autenticacao_ativa": bool(self.access_token),
+            "autenticacao_ativa": True,
         }

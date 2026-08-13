@@ -36,6 +36,11 @@ O SQLite é criado automaticamente em `instance/conversas.db`. As tabelas são i
 - `arquivos`: metadados e caminho da base ativa.
 - `modelos`: artefato e métricas do melhor pipeline.
 - `tarefas`: progresso do treinamento assíncrono.
+- `usuarios`: identidades e hashes de senha.
+- `previsoes`: downloads privados com proprietário e expiração.
+
+Conversas pertencem a um usuário; arquivos, mensagens, modelos e tarefas herdam
+esse isolamento. Na migração, a primeira conta assume as conversas legadas.
 
 ### Machine learning
 
@@ -68,4 +73,3 @@ importância dos atributos quando disponível.
 ## Evolução recomendada
 
 Separar `app.py` em blueprints e serviços, introduzir autenticação, mover tarefas para uma fila persistente e usar PostgreSQL/armazenamento de objetos em implantação multiusuário.
-
