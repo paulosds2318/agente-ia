@@ -27,6 +27,10 @@ O Atlas possui login e isolamento por proprietário, mas não deve ser exposto d
 
 Use `ATLAS_SECRET_KEY` persistente e aleatória. Em HTTPS, configure `SESSION_COOKIE_SECURE=true`.
 
+No Render, esses valores são definidos pelo Blueprint. Nunca copie a chave Gemini
+para `render.yaml`; configure-a como secret no Dashboard. O disco persistente mantém
+dados entre deploys, portanto aplique também backups e uma política de retenção.
+
 Não abra uma issue pública contendo credenciais, dados pessoais ou detalhes exploráveis. Entre em contato privadamente com o mantenedor do repositório.
 
 ## Produção

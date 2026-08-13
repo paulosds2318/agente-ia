@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, jsonify, g, send_file, sessio
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.middleware.proxy_fix import ProxyFix
 import pandas as pd
 import os
 import sqlite3
@@ -48,6 +49,8 @@ logging.basicConfig(
 logger = logging.getLogger("atlas")
 
 app = Flask(__name__)
+if os.getenv("RENDER"):
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config["JSON_AS_ASCII"] = False
 app.config.update(
     SECRET_KEY=settings.secret_key,
@@ -57,17 +60,19 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
 )
 os.makedirs(app.instance_path, exist_ok=True)
-BANCO_DADOS = os.path.join(app.instance_path, "conversas.db")
+DATA_FOLDER = os.path.abspath(os.getenv("ATLAS_DATA_DIR") or app.instance_path)
+BANCO_DADOS = os.path.join(DATA_FOLDER, "conversas.db")
 
-UPLOAD_FOLDER = os.path.abspath("uploads")
-MODEL_FOLDER = os.path.join(app.instance_path, "modelos")
-PREDICTION_FOLDER = os.path.join(app.instance_path, "previsoes")
+UPLOAD_FOLDER = os.path.join(DATA_FOLDER, "uploads")
+MODEL_FOLDER = os.path.join(DATA_FOLDER, "modelos")
+PREDICTION_FOLDER = os.path.join(DATA_FOLDER, "previsoes")
 EXTENSOES_PERMITIDAS = {"csv", "xlsx"}
 TAMANHO_MAXIMO = settings.max_upload_bytes
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = TAMANHO_MAXIMO
 
+os.makedirs(DATA_FOLDER, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(MODEL_FOLDER, exist_ok=True)
 os.makedirs(PREDICTION_FOLDER, exist_ok=True)

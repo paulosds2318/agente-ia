@@ -63,6 +63,25 @@ python app.py
 
 Acesse `http://127.0.0.1:5000`.
 
+## Implantação no Render
+
+O repositório inclui `render.yaml` com Gunicorn, health check e disco persistente.
+
+1. Envie a branch para o GitHub.
+2. No Render, escolha **New > Blueprint** e conecte o repositório.
+3. Informe `GEMINI_API_KEY` quando o Blueprint solicitar.
+4. Aguarde o health check em `/saude` ficar saudável.
+5. Abra a URL `onrender.com` e crie a primeira conta.
+
+O Blueprint usa uma instância `starter` com disco de 1 GB em `/var/data`. Isso é
+intencional: SQLite, contas, conversas, uploads e modelos seriam apagados a cada
+deploy no filesystem efêmero. A primeira conta pode ser criada mesmo com
+`ALLOW_REGISTRATION=false`; depois dela, novos cadastros ficam fechados.
+
+O serviço usa um único worker Gunicorn porque SQLite e o executor local não podem
+ser escalados horizontalmente com segurança. Para múltiplas instâncias, migre o
+banco para PostgreSQL, os artefatos para object storage e as tarefas para uma fila.
+
 ## Como usar
 
 1. Crie ou abra uma conversa.

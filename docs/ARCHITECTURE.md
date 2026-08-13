@@ -70,6 +70,13 @@ importância dos atributos quando disponível.
 - Mensagem: 3.000 caracteres.
 - Histórico enviado à IA: últimas 12 mensagens.
 
+## Render
+
+No Render, `ATLAS_DATA_DIR=/var/data` direciona banco, uploads, modelos e previsões
+ao disco persistente. Gunicorn executa um worker com quatro threads e recebe tráfego
+em `0.0.0.0:$PORT`. `ProxyFix` confia em um nível do proxy do Render para reconhecer
+HTTPS e o endereço do cliente. O health check público usa `/saude`.
+
 ## Evolução recomendada
 
 Separar `app.py` em blueprints e serviços, introduzir autenticação, mover tarefas para uma fila persistente e usar PostgreSQL/armazenamento de objetos em implantação multiusuário.

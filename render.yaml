@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: atlas-agente-dados
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 app:app
+    healthCheckPath: /saude
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: RENDER
+        value: "true"
+      - key: ATLAS_DATA_DIR
+        value: /var/data
+      - key: ATLAS_SECRET_KEY
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: FLASK_DEBUG
+        value: "false"
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: ALLOW_REGISTRATION
+        value: "false"
+      - key: MAX_PENDING_TASKS
+        value: "4"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "60"
+      - key: ARTIFACT_TTL_HOURS
+        value: "24"
+      - key: SEND_DATA_SAMPLES
+        value: "false"
+    disk:
+      name: atlas-data
+      mountPath: /var/data
+      sizeGB: 1
