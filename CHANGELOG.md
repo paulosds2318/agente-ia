@@ -1,7 +1,13 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 # Histórico de mudanças
+
+## 1.1.0 — 2026-08-13
+
+- Corrige arquivos contaminados e normaliza UTF-8.
+- Modulariza configuração, integração Gemini e segurança HTTP.
+- Adiciona autenticação opcional, rate limiting, CSP e expiração de previsões.
+- Retoma e permite cancelar tarefas persistidas.
+- Seleciona modelos pela validação cruzada e registra baseline e rastreabilidade.
+- Amplia a suíte automatizada para dez cenários.
 
 ## 1.0.0 — 2026-08-13
 
@@ -14,4 +20,3 @@ Output:
 - Persistência de modelos e previsão em lote.
 - Isolamento de dados por conversa.
 - Testes automatizados e documentação inicial.
-

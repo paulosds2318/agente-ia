@@ -1,9 +1,13 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 # API HTTP
 
 Todas as respostas de erro usam o formato `{"erro": "mensagem"}`.
+
+Quando `ATLAS_ACCESS_TOKEN` estiver configurado, envie `X-Atlas-Token` em todas
+as rotas, exceto `/` e `/saude`.
+
+## Operação
+
+- `GET /saude`: informa disponibilidade e configuração pública sem expor segredos.
 
 ## Conversas
 
@@ -51,6 +55,10 @@ Retorna `202` e um `tarefa_id`.
 ### `GET /tarefas/<id>`
 
 Retorna `status`, `progresso`, `resultado` ou `erro`.
+
+### `DELETE /tarefas/<id>`
+
+Solicita o cancelamento de uma tarefa pendente ou em processamento.
 
 ## Previsão
 

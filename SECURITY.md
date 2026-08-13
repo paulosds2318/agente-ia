@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 # Política de segurança
 
 ## Escopo
@@ -16,6 +13,17 @@ O Atlas foi projetado para uso local por uma pessoa. Não exponha diretamente o 
 - Revogue imediatamente uma chave publicada acidentalmente.
 
 ## Relato de vulnerabilidades
+
+## Defesas disponíveis
+
+- autenticação opcional por `ATLAS_ACCESS_TOKEN`;
+- limitação de requisições por endereço;
+- Content Security Policy e cabeçalhos restritivos;
+- expiração automática dos CSVs de previsão;
+- envio de amostras categóricas à IA desativado por padrão;
+- logs sem conteúdo de planilhas ou credenciais.
+
+O token local é uma proteção simples, não um sistema completo de autorização.
 
 Não abra uma issue pública contendo credenciais, dados pessoais ou detalhes exploráveis. Entre em contato privadamente com o mantenedor do repositório.
 

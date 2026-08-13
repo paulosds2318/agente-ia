@@ -1,22 +1,27 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Total output lines: 1021
-Output:
 from flask import Flask, render_template, request, jsonify, g, send_file
-from google import genai
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 import pandas as pd
 import os
 import sqlite3
 import json
+import hmac
+import io
+import csv
 import uuid
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import joblib
+import logging
+import platform
+import sklearn
+from atlas import ai
+from atlas.config import Settings
+from atlas.security import InMemoryRateLimiter, add_security_headers
 from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression
@@ -28,6 +33,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 load_dotenv()
+settings = Settings.from_env()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("atlas")
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
@@ -38,7 +49,7 @@ UPLOAD_FOLDER = os.path.abspath("uploads")
 MODEL_FOLDER = os.path.join(app.instance_path, "modelos")
 PREDICTION_FOLDER = os.path.join(app.instance_path, "previsoes")
 EXTENSOES_PERMITIDAS = {"csv", "xlsx"}
-TAMANHO_MAXIMO = 10 * 1024 * 1024
+TAMANHO_MAXIMO = settings.max_upload_bytes
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = TAMANHO_MAXIMO
@@ -47,19 +58,23 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(MODEL_FOLDER, exist_ok=True)
 os.makedirs(PREDICTION_FOLDER, exist_ok=True)
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="atlas-ml")
-
-client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY")
-)
+rate_limiter = InMemoryRateLimiter(settings.rate_limit_per_minute)
 
 
 @app.after_request
 def cabecalhos_seguranca(resposta):
-    resposta.headers["X-Content-Type-Options"] = "nosniff"
-    resposta.headers["X-Frame-Options"] = "SAMEORIGIN"
-    resposta.headers["Referrer-Policy"] = "same-origin"
-    resposta.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    return resposta
+    return add_security_headers(resposta)
+
+
+@app.before_request
+def limitar_requisicoes():
+    if request.endpoint in {"inicio", "static", "saude"}:
+        return None
+    if settings.access_token:
+        informado = request.headers.get("X-Atlas-Token", "")
+        if not hmac.compare_digest(informado, settings.access_token):
+            return jsonify({"erro": "Autenticação necessária."}), 401
+    return rate_limiter.check()
 
 def obter_banco():
     if "banco" not in g:
@@ -141,6 +156,9 @@ def iniciar_banco():
             banco.execute("ALTER TABLE mensagens ADD COLUMN status TEXT NOT NULL DEFAULT 'concluida'")
         if "erro" not in colunas_mensagens:
             banco.execute("ALTER TABLE mensagens ADD COLUMN erro TEXT")
+        colunas_tarefas = {item[1] for item in banco.execute("PRAGMA table_info(tarefas)")}
+        if "requisicao_json" not in colunas_tarefas:
+            banco.execute("ALTER TABLE tarefas ADD COLUMN requisicao_json TEXT")
         banco.commit()
 
 
@@ -185,7 +203,27 @@ def carregar_dataframe(registro):
     caminho = registro["caminho"]
     if not os.path.isfile(caminho):
         raise ValueError("O arquivo associado não está mais disponível.")
-    return pd.read_csv(caminho) if registro["extensao"] == "csv" else pd.read_excel(caminho)
+    return ler_dataframe(caminho, registro["extensao"])
+
+
+def ler_dataframe(fonte, extensao):
+    if extensao != "csv":
+        return pd.read_excel(fonte)
+    if hasattr(fonte, "read"):
+        bruto = fonte.read()
+    else:
+        bruto = Path(fonte).read_bytes()
+    if not bruto.strip():
+        raise pd.errors.EmptyDataError("O arquivo está vazio.")
+    ultimo_erro = None
+    for codificacao in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(
+                io.BytesIO(bruto), encoding=codificacao, sep=None, engine="python"
+            )
+        except (UnicodeDecodeError, pd.errors.ParserError, csv.Error) as erro:
+            ultimo_erro = erro
+    raise ValueError("Não foi possível identificar a codificação ou separador do CSV.") from ultimo_erro
 
 
 def remover_arquivo_seguro(caminho, pasta_permitida):
@@ -194,6 +232,17 @@ def remover_arquivo_seguro(caminho, pasta_permitida):
     if raiz not in alvo.parents or not alvo.is_file() or alvo.is_symlink():
         return
     alvo.unlink()
+
+
+def limpar_previsoes_expiradas():
+    limite = datetime.now(timezone.utc) - timedelta(hours=settings.artifact_ttl_hours)
+    raiz = Path(PREDICTION_FOLDER).resolve()
+    for item in raiz.glob("*.csv"):
+        if item.is_symlink() or not item.is_file():
+            continue
+        alterado = datetime.fromtimestamp(item.stat().st_mtime, timezone.utc)
+        if alterado < limite:
+            remover_arquivo_seguro(str(item), PREDICTION_FOLDER)
 
 
 @app.route("/conversas", methods=["GET"])
@@ -329,7 +378,7 @@ def gerar_resumo_dataframe(df):
         include=["object", "category"]
     )
 
-    if not categoricas.empty:
+    if not categoricas.empty and settings.send_data_samples:
 
         resumo.append(
             "\nPrincipais valores das colunas categóricas:"
@@ -403,351 +452,14 @@ def preparar_treinamento(df, alvo):
     return recursos, alvo_dados, ColumnTransformer(transformadores), classificacao, descartadas
 
 
-def treinar_legado():
-    global modelo_atual
-
-    if df_atual is None:
-        return jsonify({"erro": "Envie uma base antes de treinar um modelo."}), 400
-
-    dados = request.get_json(silent=True) or {}
-    alvo = str(dados.get("alvo", "")).strip()
-    if not alvo:
-        return jsonify({"erro": "Selecione a coluna que deseja prever."}), 400
-
-    try:
-        x, y, preparador, classificacao, descartadas = preparar_treinamento(df_atual, alvo)
-        estratificar = y if classificacao and y.value_counts().min() >= 2 else None
-        x_treino, x_teste, y_treino, y_teste = train_test_split(
-            x, y, test_size=0.2, random_state=42, stratify=estratificar
-        )
-
-        if classificacao:
-            modelos = {
-                "Regressão logística": LogisticRegression(max_iter=1000),
-                "Floresta aleatória": RandomForestClassifier(
-                    n_estimators=150, random_state=42, n_jobs=-1, class_weight="balanced"
-                )
-            }
-        else:
-            modelos = {
-                "Regressão linear": LinearRegression(),
-                "Floresta aleatória": RandomForestRegressor(
-                    n_estimators=150, random_state=42, n_jobs=-1
-                )
-            }
-
-        resultados = []
-        melhor_pipeline = None
-        melhor_pontuacao = float("-inf")
-        for nome, estimador in modelos.items():
-            pipeline = Pipeline([("preparacao", preparador), ("modelo", estimador)])
-            pipeline.fit(x_treino, y_treino)
-            previsoes = pipeline.predict(x_teste)
-            if classificacao:
-                metricas = {
-                    "acuracia": round(float(accuracy_score(y_teste, previsoes)), 4),
-                    "f1": round(float(f1_score(y_teste, previsoes, average="weighted", zero_division=0)), 4)
-                }
-                pontuacao = metricas["f1"]
-            else:
-                metricas = {
-                    "r2": round(float(r2_score(y_teste, previsoes)), 4),
-                    "mae": round(float(mean_absolute_error(y_teste, previsoes)), 4)
-                }
-                pontuacao = metricas["r2"]
-            resultados.append({"modelo": nome, "metricas": metricas})
-            if pontuacao > melhor_pontuacao:
-                melhor_pontuacao = pontuacao
-                melhor_pipeline = pipeline
-
-        resultados.sort(
-            key=lambda item: item["metricas"].get("f1", item["metricas"].get("r2", -999)),
-            reverse=True
-        )
-        modelo_atual = melhor_pipeline
-        return jsonify({
-            "tipo": "classificação" if classificacao else "regressão",
-            "alvo": alvo,
-            "linhas_treino": len(x_treino),
-            "linhas_teste": len(x_teste),
-            "recursos": x.shape[1],
-            "colunas_descartadas": descartadas,
-            "melhor_modelo": resultados[0]["modelo"],
-            "resultados": resultados
-        })
-    except ValueError as erro:
-        return jsonify({"erro": str(erro)}), 400
-    except Exception as erro:
-        print("Erro no treinamento:", erro)
-        return jsonify({"erro": "Não foi possível treinar os modelos com esta base."}), 500
-
-
 @app.route("/")
 def inicio():
     return render_template("index.html")
 
 
-def upload_legado():
-
-    global df_atual
-    global nome_arquivo_atual
-
-    if "arquivo" not in request.files:
-        return jsonify({
-            "erro": "Nenhum arquivo foi enviado."
-        }), 400
-
-    arquivo = request.files["arquivo"]
-
-    if arquivo.filename == "":
-        return jsonify({
-            "erro": "Selecione um arquivo."
-        }), 400
-
-    if not extensao_permitida(arquivo.filename):
-        return jsonify({
-            "erro": "Formato inválido. Envie somente CSV ou XLSX."
-        }), 400
-
-    nome_seguro = secure_filename(
-        arquivo.filename
-    )
-
-    caminho = os.path.join(
-        app.config["UPLOAD_FOLDER"],
-        nome_seguro
-    )
-
-    try:
-
-        arquivo.save(caminho)
-
-        if nome_seguro.lower().endswith(".csv"):
-
-            df = pd.read_csv(
-                caminho
-            )
-
-        else:
-
-            df = pd.read_excel(
-                caminho
-            )
-
-        if df.empty:
-            return jsonify({
-                "erro": "O arquivo está vazio."
-            }), 400
-
-        df_atual = df
-        nome_arquivo_atual = nome_seguro
-
-        total_linhas = len(df)
-        total_colunas = len(df.columns)
-
-        total_nulos = int(
-            df.isnull().sum().sum()
-        )
-
-        total_celulas = (
-            total_linhas
-            * total_colunas
-        )
-
-        percentual_nulos = 0
-
-        if total_celulas > 0:
-            percentual_nulos = round(
-                (
-                    total_nulos
-                    / total_celulas
-                ) * 100,
-                2
-            )
-
-        duplicados = int(
-            df.duplicated().sum()
-        )
-
-        colunas_vazias = [
-            coluna
-            for coluna in df.columns
-            if df[coluna].isnull().all()
-        ]
-
-        tipos_colunas = {
-            coluna: str(tipo)
-            for coluna, tipo
-            in df.dtypes.items()
-        }
-
-        nulos_por_coluna = {
-            coluna: int(valor)
-            for coluna, valor
-            in df.isnull().sum().items()
-            if valor > 0
-        }
-
-        return jsonify({
-
-            "mensagem":
-                f"Arquivo {nome_seguro} validado e carregado com sucesso!",
-
-            "linhas":
-                total_linhas,
-
-            "colunas":
-                list(df.columns),
-
-            "qualidade": {
-
-                …141 tokens truncated…rn jsonify({
-            "erro": "O arquivo não possui dados válidos."
-        }), 400
-
-    except Exception as erro:
-
-        print(
-            "Erro no upload:",
-            erro
-        )
-
-        return jsonify({
-            "erro": "Não foi possível processar o arquivo."
-        }), 500
-
-
-def perguntar_legado():
-
-    global df_atual
-    global nome_arquivo_atual
-
-    dados = request.get_json(
-        silent=True
-    )
-
-    if not dados:
-        return jsonify({
-            "erro": "Requisição inválida."
-        }), 400
-
-    mensagem = dados.get(
-        "mensagem",
-        ""
-    ).strip()
-
-    conversa_id = dados.get("conversa_id")
-
-    if not isinstance(conversa_id, int):
-        return jsonify({"erro": "Conversa inválida."}), 400
-
-    if not mensagem:
-        return jsonify({
-            "erro": "Digite uma mensagem."
-        }), 400
-
-    if len(mensagem) > 3000:
-        return jsonify({
-            "erro": "Sua mensagem é muito grande."
-        }), 400
-
-    contexto = mensagem
-
-    # Se existe uma planilha carregada,
-    # geramos um resumo da base inteira.
-    if df_atual is not None:
-
-        resumo = gerar_resumo_dataframe(
-            df_atual
-        )
-
-        contexto = f"""
-Você é um assistente especializado em análise de dados.
-
-Existe uma base carregada chamada:
-{nome_arquivo_atual}
-
-As informações abaixo foram calculadas pelo Python usando a base completa.
-
-RESUMO DA BASE:
-
-{resumo}
-
-PERGUNTA DO USUÁRIO:
-
-{mensagem}
-
-Regras:
-
-1. Use as informações calculadas pelo Python para responder.
-2. Não invente valores que não aparecem no resumo.
-3. Se a pergunta exigir um cálculo específico que não esteja no resumo, diga que é necessário calcular esse indicador.
-4. Responda em português.
-5. Seja claro, direto e didático.
-"""
-
-    try:
-
-        salvar_mensagem(conversa_id, "usuario", mensagem)
-
-        historico = obter_banco().execute(
-            "SELECT autor, conteudo FROM mensagens WHERE conversa_id = ? ORDER BY id DESC LIMIT 12",
-            (conversa_id,)
-        ).fetchall()
-
-        historico_texto = "\n".join(
-            f"{'Usuário' if item['autor'] == 'usuario' else 'Assistente'}: {item['conteudo']}"
-            for item in reversed(historico)
-        )
-
-        contexto = (
-            f"Histórico desta conversa:\n{historico_texto}"
-            f"\n\nContexto e solicitação atual:\n{contexto}"
-        )
-
-        conversa_chat = client.chats.create(
-            model="gemini-3.6-flash"
-        )
-
-        resposta = conversa_chat.send_message(
-            contexto
-        )
-
-        if not resposta.text:
-            return jsonify({
-                "erro":
-                    "A IA não retornou uma resposta."
-            }), 500
-
-        salvar_mensagem(conversa_id, "agente", resposta.text)
-
-        banco = obter_banco()
-        total = banco.execute(
-            "SELECT COUNT(*) FROM mensagens WHERE conversa_id = ?", (conversa_id,)
-        ).fetchone()[0]
-        titulo = None
-        if total == 2:
-            titulo = mensagem[:55] + ("…" if len(mensagem) > 55 else "")
-            banco.execute("UPDATE conversas SET titulo = ? WHERE id = ?", (titulo, conversa_id))
-            banco.commit()
-
-        return jsonify({
-            "resposta":
-                resposta.text,
-            "titulo": titulo
-        })
-
-    except Exception as erro:
-
-        print(
-            "Erro Gemini:",
-            erro
-        )
-
-        return jsonify({
-            "erro":
-                "Não foi possível obter resposta da IA."
-        }), 500
+@app.route("/saude")
+def saude():
+    return jsonify({"status": "ok", "configuracao": settings.public_status()})
 
 
 def diagnostico_qualidade(df):
@@ -781,11 +493,14 @@ def upload():
     caminho = os.path.join(UPLOAD_FOLDER, f"{conversa_id}_{uuid.uuid4().hex}.{extensao}")
     try:
         arquivo.save(caminho)
-        df = pd.read_csv(caminho) if extensao == "csv" else pd.read_excel(caminho)
+        df = ler_dataframe(caminho, extensao)
         if df.empty:
             raise ValueError("O arquivo está vazio.")
-        if len(df) > 1_000_000 or len(df.columns) > 1_000:
-            raise ValueError("A base excede o limite de 1 milhão de linhas ou 1.000 colunas.")
+        if len(df) > settings.max_rows or len(df.columns) > settings.max_columns:
+            raise ValueError(
+                f"A base excede o limite de {settings.max_rows:,} linhas "
+                f"ou {settings.max_columns:,} colunas."
+            )
         qualidade = diagnostico_qualidade(df)
         banco = obter_banco()
         antigos = banco.execute("SELECT caminho FROM arquivos WHERE conversa_id = ?", (conversa_id,)).fetchall()
@@ -811,7 +526,7 @@ def upload():
         return jsonify({"erro": str(erro) or "O arquivo não possui dados válidos."}), 400
     except Exception as erro:
         if os.path.isfile(caminho): os.remove(caminho)
-        print("Erro no upload:", erro)
+        logger.exception("Falha no upload", extra={"conversa_id": conversa_id})
         return jsonify({"erro": "Não foi possível processar o arquivo."}), 500
 
 
@@ -827,9 +542,22 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
             x, y, preparador, classificacao, descartadas = preparar_treinamento(df, alvo)
             contagens = y.value_counts()
             avisos = []
+            alvo_normalizado = str(alvo).strip().lower().replace(" ", "_")
+            suspeitas_vazamento = [
+                str(coluna) for coluna in x.columns
+                if alvo_normalizado in str(coluna).strip().lower().replace(" ", "_")
+            ]
+            if pd.api.types.is_numeric_dtype(y):
+                for coluna in x.select_dtypes(include="number").columns:
+                    correlacao = x[coluna].corr(y)
+                    if pd.notna(correlacao) and abs(correlacao) > .98:
+                        suspeitas_vazamento.append(str(coluna))
+            suspeitas_vazamento = sorted(set(suspeitas_vazamento))
             if len(y) < 100: avisos.append("Base pequena: interprete as métricas com cautela.")
             if classificacao and contagens.min() / contagens.max() < .25:
                 avisos.append("Classes desbalanceadas detectadas.")
+            if suspeitas_vazamento:
+                avisos.append("Possível vazamento de dados detectado; revise as colunas sinalizadas.")
             estratificar = y if classificacao and contagens.min() >= 2 else None
             x_tr, x_te, y_tr, y_te = train_test_split(x, y, test_size=.2, random_state=42, stratify=estratificar)
             modelos = ({
@@ -840,13 +568,19 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
                 "Floresta aleatória": RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
             })
             resultados, melhor, melhor_nome, melhor_score = [], None, None, float("-inf")
+            scoring = "f1_weighted" if classificacao else "r2"
+            folds = min(5, int(contagens.min()) if classificacao else len(y) // 5)
+            folds = max(2, folds)
+            cv = StratifiedKFold(folds, shuffle=True, random_state=42) if classificacao else KFold(folds, shuffle=True, random_state=42)
+            baseline = DummyClassifier(strategy="most_frequent") if classificacao else DummyRegressor(strategy="mean")
+            baseline_pipeline = Pipeline([("preparacao", preparador), ("modelo", baseline)])
+            baseline_score = float(cross_val_score(baseline_pipeline, x, y, cv=cv, scoring=scoring).mean())
             for indice, (nome, estimador) in enumerate(modelos.items()):
+                status = banco.execute("SELECT status FROM tarefas WHERE id=?", (tarefa_id,)).fetchone()
+                if status and status["status"] == "cancelada":
+                    return
                 pipeline = Pipeline([("preparacao", preparador), ("modelo", estimador)])
                 pipeline.fit(x_tr, y_tr); previsto = pipeline.predict(x_te)
-                folds = min(5, int(contagens.min()) if classificacao else len(y) // 5)
-                folds = max(2, folds)
-                cv = StratifiedKFold(folds, shuffle=True, random_state=42) if classificacao else KFold(folds, shuffle=True, random_state=42)
-                scoring = "f1_weighted" if classificacao else "r2"
                 cv_scores = cross_val_score(pipeline, x, y, cv=cv, scoring=scoring, n_jobs=1)
                 if classificacao:
                     metricas = {"acuracia": accuracy_score(y_te, previsto),
@@ -855,25 +589,38 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
                                 "recall": recall_score(y_te, previsto, average="weighted", zero_division=0),
                                 "matriz_confusao": confusion_matrix(y_te, previsto).tolist(),
                                 "validacao_cruzada": float(cv_scores.mean())}
-                    score = metricas["f1"]
                 else:
                     metricas = {"r2": r2_score(y_te, previsto), "mae": mean_absolute_error(y_te, previsto),
                                 "rmse": mean_squared_error(y_te, previsto) ** .5,
                                 "validacao_cruzada": float(cv_scores.mean())}
-                    score = metricas["r2"]
+                score = float(cv_scores.mean())
                 metricas = {k: (round(float(v), 4) if not isinstance(v, list) else v) for k, v in metricas.items()}
                 resultados.append({"modelo": nome, "metricas": metricas})
                 if score > melhor_score: melhor, melhor_nome, melhor_score = pipeline, nome, score
                 banco.execute("UPDATE tarefas SET progresso=?, atualizada_em=? WHERE id=?",
                               (45 + indice * 35, agora_iso(), tarefa_id)); banco.commit()
-            resultados.sort(key=lambda r: r["metricas"].get("f1", r["metricas"].get("r2", -999)), reverse=True)
+            resultados.sort(key=lambda r: r["metricas"]["validacao_cruzada"], reverse=True)
+            importancia = []
+            estimador_final = melhor.named_steps["modelo"]
+            if hasattr(estimador_final, "feature_importances_"):
+                nomes = melhor.named_steps["preparacao"].get_feature_names_out()
+                importancia = sorted(
+                    ({"recurso": str(nome), "importancia": round(float(valor), 6)}
+                     for nome, valor in zip(nomes, estimador_final.feature_importances_)),
+                    key=lambda item: item["importancia"], reverse=True
+                )[:15]
             caminho_modelo = os.path.join(MODEL_FOLDER, f"{conversa_id}_{uuid.uuid4().hex}.joblib")
             pacote = {"pipeline": melhor, "colunas": list(x.columns), "alvo": alvo,
-                      "tipo": "classificação" if classificacao else "regressão"}
+                      "tipo": "classificação" if classificacao else "regressão",
+                      "versoes": {"python": platform.python_version(), "sklearn": sklearn.__version__},
+                      "treinado_em": agora_iso()}
             joblib.dump(pacote, caminho_modelo)
             resultado = {"tipo": pacote["tipo"], "alvo": alvo, "linhas_treino": len(x_tr),
                          "linhas_teste": len(x_te), "recursos": x.shape[1], "avisos": avisos,
                          "colunas_descartadas": descartadas, "melhor_modelo": melhor_nome,
+                         "baseline_validacao_cruzada": round(baseline_score, 4),
+                         "possivel_vazamento": suspeitas_vazamento,
+                         "importancia_recursos": importancia, "versoes": pacote["versoes"],
                          "resultados": resultados}
             antigos = banco.execute("SELECT caminho FROM modelos WHERE conversa_id=?", (conversa_id,)).fetchall()
             banco.execute("DELETE FROM modelos WHERE conversa_id=?", (conversa_id,))
@@ -885,6 +632,7 @@ def executar_treinamento(tarefa_id, conversa_id, alvo):
                           (json.dumps(resultado, ensure_ascii=False), agora_iso(), tarefa_id)); banco.commit()
             for item in antigos: remover_arquivo_seguro(item["caminho"], MODEL_FOLDER)
         except Exception as erro:
+            logger.exception("Falha no treinamento", extra={"tarefa_id": tarefa_id, "conversa_id": conversa_id})
             banco.execute("UPDATE tarefas SET status='falhou', erro=?, atualizada_em=? WHERE id=?",
                           (str(erro), agora_iso(), tarefa_id)); banco.commit()
 
@@ -897,8 +645,8 @@ def treinar():
     if not alvo: return jsonify({"erro": "Selecione a coluna que deseja prever."}), 400
     if arquivo_da_conversa(conversa_id) is None: return jsonify({"erro": "Envie uma base antes de treinar."}), 400
     tarefa_id = uuid.uuid4().hex; agora = agora_iso(); banco = obter_banco()
-    banco.execute("INSERT INTO tarefas (id, conversa_id, tipo, status, progresso, criada_em, atualizada_em) VALUES (?,?,'treinamento','pendente',0,?,?)",
-                  (tarefa_id, conversa_id, agora, agora)); banco.commit()
+    banco.execute("INSERT INTO tarefas (id, conversa_id, tipo, status, progresso, criada_em, atualizada_em, requisicao_json) VALUES (?,?,'treinamento','pendente',0,?,?,?)",
+                  (tarefa_id, conversa_id, agora, agora, json.dumps({"alvo": alvo}, ensure_ascii=False))); banco.commit()
     executor.submit(executar_treinamento, tarefa_id, conversa_id, alvo)
     return jsonify({"tarefa_id": tarefa_id, "status": "pendente"}), 202
 
@@ -911,6 +659,19 @@ def consultar_tarefa(tarefa_id):
     return jsonify(dados)
 
 
+@app.route("/tarefas/<tarefa_id>", methods=["DELETE"])
+def cancelar_tarefa(tarefa_id):
+    banco = obter_banco()
+    cursor = banco.execute(
+        "UPDATE tarefas SET status='cancelada', atualizada_em=? WHERE id=? AND status IN ('pendente','processando')",
+        (agora_iso(), tarefa_id),
+    )
+    banco.commit()
+    if cursor.rowcount == 0:
+        return jsonify({"erro": "Tarefa não encontrada ou já finalizada."}), 409
+    return "", 204
+
+
 @app.route("/prever", methods=["POST"])
 def prever():
     conversa_id = request.form.get("conversa_id", type=int); arquivo = request.files.get("arquivo")
@@ -919,7 +680,8 @@ def prever():
     if modelo is None or not os.path.isfile(modelo["caminho"]): return jsonify({"erro": "Treine um modelo antes de prever."}), 400
     if not arquivo or not extensao_permitida(arquivo.filename): return jsonify({"erro": "Envie um CSV ou XLSX válido."}), 400
     try:
-        entrada = pd.read_csv(arquivo) if arquivo.filename.lower().endswith(".csv") else pd.read_excel(arquivo)
+        extensao = "csv" if arquivo.filename.lower().endswith(".csv") else "xlsx"
+        entrada = ler_dataframe(arquivo, extensao)
         pacote = joblib.load(modelo["caminho"]); ausentes = [c for c in pacote["colunas"] if c not in entrada.columns]
         if ausentes: return jsonify({"erro": "Faltam colunas: " + ", ".join(map(str, ausentes))}), 400
         previsoes = pacote["pipeline"].predict(entrada[pacote["colunas"]]); saida = entrada.copy()
@@ -931,11 +693,13 @@ def prever():
         saida.to_csv(caminho, index=False, encoding="utf-8-sig")
         return jsonify({"mensagem": f"{len(saida)} previsões geradas.", "download": f"/previsoes/{token}"})
     except Exception as erro:
-        print("Erro na previsão:", erro); return jsonify({"erro": "Não foi possível gerar as previsões."}), 500
+        logger.exception("Falha na previsão", extra={"conversa_id": conversa_id})
+        return jsonify({"erro": "Não foi possível gerar as previsões."}), 500
 
 
 @app.route("/previsoes/<token>")
 def baixar_previsao(token):
+    limpar_previsoes_expiradas()
     if not token.isalnum(): return jsonify({"erro": "Arquivo inválido."}), 400
     caminho = os.path.join(PREDICTION_FOLDER, f"{token}.csv")
     if not os.path.isfile(caminho): return jsonify({"erro": "Previsão não encontrada."}), 404
@@ -947,7 +711,7 @@ def perguntar():
     dados = request.get_json(silent=True) or {}; mensagem = str(dados.get("mensagem", "")).strip(); conversa_id = dados.get("conversa_id")
     if not isinstance(conversa_id, int) or obter_conversa(conversa_id) is None: return jsonify({"erro": "Conversa inválida."}), 400
     if not mensagem: return jsonify({"erro": "Digite uma mensagem."}), 400
-    if len(mensagem) > 3000: return jsonify({"erro": "Sua mensagem é muito grande."}), 400
+    if len(mensagem) > settings.max_message_chars: return jsonify({"erro": "Sua mensagem é muito grande."}), 400
     mensagem_id = salvar_mensagem(conversa_id, "usuario", mensagem, "processando")
     try:
         registro = arquivo_da_conversa(conversa_id); contexto_dados = ""
@@ -957,21 +721,21 @@ def perguntar():
         historico = obter_banco().execute("SELECT autor, conteudo FROM mensagens WHERE conversa_id=? ORDER BY id DESC LIMIT 12", (conversa_id,)).fetchall()
         contexto = "Você é um assistente de análise de dados. Responda em português, sem inventar valores.\n" + contexto_dados
         contexto += "\nHistórico:\n" + "\n".join(f"{m['autor']}: {m['conteudo']}" for m in reversed(historico))
-        resposta = client.chats.create(model="gemini-3.6-flash").send_message(contexto)
-        if not resposta.text: raise RuntimeError("A IA retornou uma resposta vazia.")
-        salvar_mensagem(conversa_id, "agente", resposta.text)
+        resposta_texto = ai.send_message(settings, contexto)
+        salvar_mensagem(conversa_id, "agente", resposta_texto)
         banco = obter_banco(); banco.execute("UPDATE mensagens SET status='concluida', erro=NULL WHERE id=?", (mensagem_id,))
         total = banco.execute("SELECT COUNT(*) FROM mensagens WHERE conversa_id=?", (conversa_id,)).fetchone()[0]; titulo = None
         if total == 2:
             titulo = mensagem[:55] + ("…" if len(mensagem) > 55 else ""); banco.execute("UPDATE conversas SET titulo=? WHERE id=?", (titulo, conversa_id))
-        banco.commit(); return jsonify({"resposta": resposta.text, "titulo": titulo})
+        banco.commit(); return jsonify({"resposta": resposta_texto, "titulo": titulo})
     except Exception as erro:
         texto = str(erro); codigo = 500; mensagem_erro = "Não foi possível obter resposta da IA."
         if "429" in texto or "RESOURCE_EXHAUSTED" in texto: codigo, mensagem_erro = 429, "Limite da IA atingido. Aguarde e tente novamente."
         elif "401" in texto or "API_KEY" in texto: codigo, mensagem_erro = 503, "A chave da IA está inválida ou ausente."
         elif "timeout" in texto.lower(): codigo, mensagem_erro = 504, "A IA demorou demais para responder. Tente novamente."
         banco = obter_banco(); banco.execute("UPDATE mensagens SET status='falhou', erro=? WHERE id=?", (mensagem_erro, mensagem_id)); banco.commit()
-        print("Erro Gemini:", erro); return jsonify({"erro": mensagem_erro, "mensagem_id": mensagem_id}), codigo
+        logger.warning("Falha na IA conversa_id=%s tipo=%s", conversa_id, type(erro).__name__)
+        return jsonify({"erro": mensagem_erro, "mensagem_id": mensagem_id}), codigo
 
 
 @app.route("/mensagens/<int:mensagem_id>/tentar-novamente", methods=["POST"])
@@ -995,6 +759,31 @@ def arquivo_muito_grande(erro):
 iniciar_banco()
 
 
+def recuperar_tarefas_pendentes():
+    with app.app_context():
+        banco = obter_banco()
+        tarefas = banco.execute(
+            "SELECT id, conversa_id, requisicao_json FROM tarefas WHERE status IN ('pendente','processando')"
+        ).fetchall()
+        for tarefa in tarefas:
+            requisicao = json.loads(tarefa["requisicao_json"] or "{}")
+            alvo = requisicao.get("alvo")
+            if alvo:
+                banco.execute(
+                    "UPDATE tarefas SET status='pendente', progresso=0, atualizada_em=? WHERE id=?",
+                    (agora_iso(), tarefa["id"]),
+                )
+                executor.submit(executar_treinamento, tarefa["id"], tarefa["conversa_id"], alvo)
+            else:
+                banco.execute(
+                    "UPDATE tarefas SET status='falhou', erro=?, atualizada_em=? WHERE id=?",
+                    ("Tarefa antiga sem parâmetros para retomada.", agora_iso(), tarefa["id"]),
+                )
+        banco.commit()
+
+
+recuperar_tarefas_pendentes()
+
+
 if __name__ == "__main__":
     app.run(debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
-

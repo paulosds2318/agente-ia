@@ -1,12 +1,9 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 import io
 import os
 import tempfile
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -24,6 +21,7 @@ class AtlasTestCase(unittest.TestCase):
         for pasta in (modulo.UPLOAD_FOLDER, modulo.MODEL_FOLDER, modulo.PREDICTION_FOLDER):
             os.makedirs(pasta)
         modulo.app.config.update(TESTING=True, UPLOAD_FOLDER=modulo.UPLOAD_FOLDER)
+        modulo.rate_limiter = modulo.InMemoryRateLimiter(10_000)
         modulo.iniciar_banco()
         self.cliente = modulo.app.test_client()
         self.conversa = self.cliente.post("/conversas").get_json()["id"]
@@ -48,8 +46,7 @@ class AtlasTestCase(unittest.TestCase):
         }, content_type="multipart/form-data")
 
     def test_historico_persistente(self):
-        chat = MagicMock(); chat.send_message.return_value.text = "Resposta salva"
-        with patch.object(modulo.client.chats, "create", return_value=chat):
+        with patch.object(modulo.ai, "send_message", return_value="Resposta salva"):
             resposta = self.cliente.post("/perguntar", json={
                 "conversa_id": self.conversa, "mensagem": "Analise esta base"
             })
@@ -85,7 +82,68 @@ class AtlasTestCase(unittest.TestCase):
         }, content_type="multipart/form-data")
         self.assertEqual(resposta.status_code, 400)
 
+    def test_saude_nao_expoe_chave(self):
+        resposta = self.cliente.get("/saude")
+        self.assertEqual(resposta.status_code, 200)
+        self.assertNotIn("api_key", resposta.get_data(as_text=True).lower())
+
+    def test_cabecalhos_de_seguranca(self):
+        resposta = self.cliente.get("/")
+        self.assertEqual(resposta.headers["X-Frame-Options"], "DENY")
+        self.assertIn("default-src 'self'", resposta.headers["Content-Security-Policy"])
+
+    def test_chat_sem_chave_retorna_503(self):
+        configuracao = modulo.settings
+        modulo.settings = type(configuracao)(**{
+            **configuracao.__dict__, "gemini_api_key": None
+        })
+        try:
+            resposta = self.cliente.post("/perguntar", json={
+                "conversa_id": self.conversa, "mensagem": "Olá"
+            })
+        finally:
+            modulo.settings = configuracao
+        self.assertEqual(resposta.status_code, 503)
+
+    def test_rejeita_extensao_invalida(self):
+        resposta = self.cliente.post("/upload", data={
+            "conversa_id": str(self.conversa),
+            "arquivo": (io.BytesIO(b"conteudo"), "dados.txt")
+        }, content_type="multipart/form-data")
+        self.assertEqual(resposta.status_code, 400)
+
+    def test_rejeita_csv_vazio(self):
+        resposta = self.cliente.post("/upload", data={
+            "conversa_id": str(self.conversa),
+            "arquivo": (io.BytesIO(b""), "vazio.csv")
+        }, content_type="multipart/form-data")
+        self.assertEqual(resposta.status_code, 400)
+
+    def test_aceita_csv_cp1252_com_ponto_e_virgula(self):
+        conteudo = "cidade;valor\nSão Paulo;10\nRecife;20\n".encode("cp1252")
+        resposta = self.cliente.post("/upload", data={
+            "conversa_id": str(self.conversa),
+            "arquivo": (io.BytesIO(conteudo), "dados.csv")
+        }, content_type="multipart/form-data")
+        self.assertEqual(resposta.status_code, 200, resposta.get_json())
+        self.assertEqual(resposta.get_json()["colunas"], ["cidade", "valor"])
+
+    def test_previsao_rejeita_coluna_ausente(self):
+        self.assertEqual(self.enviar_base().status_code, 200)
+        inicio = self.cliente.post("/treinar", json={"conversa_id": self.conversa, "alvo": "comprou"})
+        tarefa_id = inicio.get_json()["tarefa_id"]
+        for _ in range(120):
+            tarefa = self.cliente.get(f"/tarefas/{tarefa_id}").get_json()
+            if tarefa["status"] in ("concluida", "falhou"):
+                break
+            time.sleep(.1)
+        arquivo = io.BytesIO(b"idade\n30\n")
+        resposta = self.cliente.post("/prever", data={
+            "conversa_id": str(self.conversa), "arquivo": (arquivo, "novos.csv")
+        }, content_type="multipart/form-data")
+        self.assertEqual(resposta.status_code, 400)
+        self.assertIn("Faltam colunas", resposta.get_json()["erro"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

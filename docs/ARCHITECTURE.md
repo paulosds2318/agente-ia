@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 # Arquitetura
 
 ## Visão geral
@@ -18,6 +15,13 @@ Flask ─────────────── Gemini API
 ```
 
 ## Componentes
+
+### Núcleo modular
+
+- `atlas/config.py`: configuração tipada e limites operacionais.
+- `atlas/ai.py`: integração lazy com Gemini.
+- `atlas/security.py`: rate limiting local e cabeçalhos HTTP.
+- `app.py`: composição Flask, rotas e orquestração.
 
 ### Interface
 
@@ -49,6 +53,12 @@ Identificadores textuais de alta cardinalidade são descartados. O melhor pipeli
 O treinamento usa `ThreadPoolExecutor` com dois workers. O navegador consulta `/tarefas/<id>` até conclusão. Para produção distribuída, substitua-o por Celery, RQ ou serviço equivalente.
 
 ## Limites
+
+As tarefas ficam persistidas no SQLite. Tarefas interrompidas são retomadas na
+inicialização e podem ser canceladas pela API. O melhor algoritmo é escolhido
+pela validação cruzada; o conjunto de teste fica reservado para apresentação.
+O resultado registra baseline, versões, possíveis sinais de vazamento e
+importância dos atributos quando disponível.
 
 - Upload HTTP: 10 MB.
 - Base processada: até 1 milhão de linhas e 1.000 colunas.
