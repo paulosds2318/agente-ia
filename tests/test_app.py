@@ -1,6 +1,3 @@
-Exit code: 0
-Wall time: 0.3 seconds
-Output:
 import io
 import os
 import tempfile
@@ -49,7 +46,9 @@ class AtlasTestCase(unittest.TestCase):
 
     def test_historico_persistente(self):
         chat = MagicMock(); chat.send_message.return_value.text = "Resposta salva"
-        with patch.object(modulo.client.chats, "create", return_value=chat):
+        cliente_ia = MagicMock()
+        cliente_ia.chats.create.return_value = chat
+        with patch.object(modulo, "obter_cliente_ia", return_value=cliente_ia):
             resposta = self.cliente.post("/perguntar", json={
                 "conversa_id": self.conversa, "mensagem": "Analise esta base"
             })
